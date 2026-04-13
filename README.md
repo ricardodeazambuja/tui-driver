@@ -126,6 +126,33 @@ Or via environment variable:
 TUI_DIR=/path/to/project tui-driver gemini start
 ```
 
+### Attaching to an existing tmux session
+
+tui-driver only speaks tmux — it cannot drive a plain xterm, gnome-terminal,
+or GNU screen session. If you want to attach to a TUI you started yourself
+(for example, to inspect it interactively while a script also drives it),
+launch it inside a named tmux session first:
+
+```bash
+# Start the TUI inside a named, detached tmux session
+tmux new-session -d -s mysession gemini
+
+# Attach interactively any time with:
+#   tmux attach -t mysession
+
+# Point tui-driver at that same session via --session
+tui-driver --session mysession gemini send "Hello"
+```
+
+Notes:
+
+- Skip `tui-driver ... start` — the session already exists. Go straight to
+  `send` / `respond` / `poll`.
+- The TUI command passed to tui-driver (`gemini` above) is only used as a
+  label; the actual process is whatever you launched in the tmux session.
+- `stop` will kill the session you attached to, so use plain `tmux kill-session
+  -t mysession` (or just detach) if you want to keep it alive.
+
 ### Quiet mode (for AI agents)
 
 Suppress stderr logs to save tokens when an AI agent is the caller:
