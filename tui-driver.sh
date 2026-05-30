@@ -255,10 +255,23 @@ _wait_stable() {
     local prev_hash=""
     local stable=0
 
+    # Heartbeat: refresh the activity stamp on entry and on every poll below.
+    # The active wait loop is proof the caller is still alive, so it holds the
+    # watchdog off for the duration of a single response. This does NOT neuter
+    # the watchdog: _wait_stable is bounded by MAX_WAIT (TUI_TIMEOUT), so the
+    # hold-off lasts at most one response window; once the wait returns, normal
+    # idle-counting resumes. Net semantics: TUI_TIMEOUT bounds a single
+    # response, TUI_WATCHDOG bounds caller *absence*. The entry stamp also
+    # narrows the race where the prior stamp is near-expiry as the wait begins
+    # (the brief throttle+paste preamble before this point stays uncovered, but
+    # that only matters if the caller was already idle ~TUI_WATCHDOG).
+    _stamp
+
     sleep "$POLL_INTERVAL"
     elapsed=$POLL_INTERVAL
 
     while [ "$elapsed" -lt "$timeout" ]; do
+        _stamp
         local cur_hash
         cur_hash=$(_screen_hash)
 
@@ -564,7 +577,13 @@ cmd_poll() {
         return 0
     fi
 
-    # Still changing
+    # Still changing. Refresh the stamp so each poll counts as caller liveness.
+    # Note: this only beats at the moments polls happen — a manual poller that
+    # does more than TUI_WATCHDOG seconds of work *between* polls can still be
+    # reaped (not polling is not demonstrable liveness). For long async waits,
+    # prefer `poll --wait` in the background, which heartbeats continuously via
+    # _wait_stable.
+    _stamp
     log "Still waiting ..."
     echo "waiting"
     return 1

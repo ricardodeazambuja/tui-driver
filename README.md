@@ -246,6 +246,22 @@ TUI_TIMEOUT=600 tui-driver claude send "Write a long essay"
 TUI_MIN_INTERVAL=10 TUI_JITTER=5 tui-driver agy send "Query 1"
 ```
 
+**`TUI_TIMEOUT` vs `TUI_WATCHDOG`.** These bound two different things and do
+not interfere:
+
+- `TUI_TIMEOUT` bounds a **single response** — how long one `send` /
+  `poll --wait` will wait for the screen to stabilise.
+- `TUI_WATCHDOG` bounds **caller absence** — how long a session may sit with no
+  caller activity before it is auto-reaped (in case the caller died).
+
+While a blocking call is waiting, its poll loop heartbeats the activity stamp,
+so the watchdog never reaps a session mid-response — even when a single response
+takes longer than `TUI_WATCHDOG`. You can therefore set `TUI_TIMEOUT` well above
+`TUI_WATCHDOG` safely. The one case the heartbeat can't cover is non-blocking
+`poll`: it only refreshes liveness at the moment each poll runs, so a caller
+using `send-async` + manual `poll` should poll more often than `TUI_WATCHDOG`
+(or use `poll --wait` in the background, which heartbeats continuously).
+
 ### Debugging
 
 Grab the raw screen capture (no extraction, no waiting):
