@@ -41,6 +41,27 @@ tui-driver agy stop
 duration of the task — this preserves conversation context and avoids
 unnecessary startup time. Only stop when you are fully done with web access.
 
+### Recovering a stuck or orphaned session
+
+If a session misbehaves — `poll` never returns, `start` reports one is already
+running but `send` does nothing, or a previous run crashed and left a session
+behind — use these to recover:
+
+```bash
+# See every tui-driver session and its state (across all directories)
+tui-driver list
+
+# Clear sessions orphaned by a crashed/killed prior run
+# (only touches dead-watchdog, idle sessions — never a live one)
+tui-driver agy reap
+
+# Force a clean restart of a live-but-wedged session
+tui-driver agy stop && tui-driver agy start
+```
+
+`reap` is safe to run anytime: it never kills a session that is actively in
+use. For a session that is alive but stuck, `stop` then `start` is the fix.
+
 ## Sending Queries (Async Pattern)
 
 **Always use `send-async` + `poll --wait` (run in background).** This avoids
