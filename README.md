@@ -2,14 +2,14 @@
 
 Drive any interactive TUI programmatically via tmux. No profiles, no
 pattern-matching, no TUI-specific code. One shell script that works with
-**any** terminal application -- Gemini CLI, Claude Code, aichat, btop,
+**any** terminal application -- Antigravity CLI, Claude Code, aichat, btop,
 you name it.
 
 ```
-tui-driver gemini start
-response=$(tui-driver gemini send "Summarise the LICENSE file")
+tui-driver agy start
+response=$(tui-driver agy send "Summarise the LICENSE file")
 echo "$response"
-tui-driver gemini stop
+tui-driver agy stop
 ```
 
 ## How it works
@@ -49,7 +49,7 @@ brew install tmux python3
 
 # Option 2: just run it directly
 chmod +x tui-driver.sh
-./tui-driver.sh gemini start
+./tui-driver.sh agy start
 ```
 
 After `install`, make sure `~/.local/bin` is in your `PATH`:
@@ -69,9 +69,9 @@ tui-driver uninstall
 ### Basic session
 
 ```bash
-tui-driver gemini start
-tui-driver gemini send "What is the mass of the Sun?"
-tui-driver gemini stop
+tui-driver agy start
+tui-driver agy send "What is the mass of the Sun?"
+tui-driver agy stop
 ```
 
 ### Multiple TUIs at once
@@ -80,18 +80,18 @@ Each TUI command gets its own tmux session, so you can run them in
 parallel:
 
 ```bash
-tui-driver gemini start
+tui-driver agy start
 tui-driver claude start
 
-gemini_answer=$(tui-driver gemini send "Explain quantum tunnelling")
+agy_answer=$(tui-driver agy send "Explain quantum tunnelling")
 claude_answer=$(tui-driver claude send "Explain quantum tunnelling")
 
-echo "=== Gemini ==="
-echo "$gemini_answer"
+echo "=== Antigravity ==="
+echo "$agy_answer"
 echo "=== Claude ==="
 echo "$claude_answer"
 
-tui-driver gemini stop
+tui-driver agy stop
 tui-driver claude stop
 ```
 
@@ -116,14 +116,14 @@ tui-driver aichat respond ""
 Tell the TUI which directory to start in:
 
 ```bash
-tui-driver --dir /path/to/project gemini start
-tui-driver gemini send "Explain the code in main.py"
+tui-driver --dir /path/to/project agy start
+tui-driver agy send "Explain the code in main.py"
 ```
 
 Or via environment variable:
 
 ```bash
-TUI_DIR=/path/to/project tui-driver gemini start
+TUI_DIR=/path/to/project tui-driver agy start
 ```
 
 ### Attaching to an existing tmux session
@@ -135,20 +135,20 @@ launch it inside a named tmux session first:
 
 ```bash
 # Start the TUI inside a named, detached tmux session
-tmux new-session -d -s mysession gemini
+tmux new-session -d -s mysession agy
 
 # Attach interactively any time with:
 #   tmux attach -t mysession
 
 # Point tui-driver at that same session via --session
-tui-driver --session mysession gemini send "Hello"
+tui-driver --session mysession agy send "Hello"
 ```
 
 Notes:
 
 - Skip `tui-driver ... start` — the session already exists. Go straight to
   `send` / `respond` / `poll`.
-- The TUI command passed to tui-driver (`gemini` above) is only used as a
+- The TUI command passed to tui-driver (`agy` above) is only used as a
   label; the actual process is whatever you launched in the tmux session.
 - `stop` will kill the session you attached to, so use plain `tmux kill-session
   -t mysession` (or just detach) if you want to keep it alive.
@@ -158,8 +158,8 @@ Notes:
 Suppress stderr logs to save tokens when an AI agent is the caller:
 
 ```bash
-tui-driver -q gemini start
-tui-driver -q gemini send "Hello"
+tui-driver -q agy start
+tui-driver -q agy send "Hello"
 ```
 
 ### Non-blocking (async) usage
@@ -168,19 +168,19 @@ For AI agents that need to fire a query and do other work while waiting:
 
 ```bash
 # Fire the prompt and return immediately
-tui-driver gemini send-async "Analyse all files in this repo"
+tui-driver agy send-async "Analyse all files in this repo"
 
 # Do other work ...
 
 # Check back (non-blocking): exits 0 if ready, 1 if still working
-if tui-driver gemini poll; then
+if tui-driver agy poll; then
     echo "Response is ready (printed to stdout above)"
 else
     echo "Still thinking..."
 fi
 
 # Or block until the response arrives
-tui-driver gemini poll --wait
+tui-driver agy poll --wait
 ```
 
 Only one async query can be pending per session. Call `poll` to retrieve
@@ -192,13 +192,13 @@ All timing is configurable via environment variables:
 
 ```bash
 # Fast-responding TUI: poll every second, require 1 stable check
-TUI_POLL=1 TUI_STABLE=1 tui-driver gemini send "Hi"
+TUI_POLL=1 TUI_STABLE=1 tui-driver agy send "Hi"
 
 # Slow API behind the TUI: wait up to 10 minutes
 TUI_TIMEOUT=600 tui-driver claude send "Write a long essay"
 
 # Cautious rate limiting: 10s minimum gap + up to 5s jitter
-TUI_MIN_INTERVAL=10 TUI_JITTER=5 tui-driver gemini send "Query 1"
+TUI_MIN_INTERVAL=10 TUI_JITTER=5 tui-driver agy send "Query 1"
 ```
 
 ### Debugging
@@ -206,13 +206,13 @@ TUI_MIN_INTERVAL=10 TUI_JITTER=5 tui-driver gemini send "Query 1"
 Grab the raw screen capture (no extraction, no waiting):
 
 ```bash
-tui-driver gemini raw
+tui-driver agy raw
 ```
 
 Check whether a session is running:
 
 ```bash
-tui-driver gemini status   # prints "running" or "stopped"
+tui-driver agy status   # prints "running" or "stopped"
 ```
 
 ## Full API reference
@@ -309,8 +309,8 @@ The raw capture is always available via `raw`.
 
 ### Random session names
 
-Session names look like `tui-gemini-1038314688` instead of a
-predictable `tui-gemini`. This avoids accidental collisions when
+Session names look like `tui-agy-1038314688` instead of a
+predictable `tui-agy`. This avoids accidental collisions when
 multiple callers share the same TUI command, and makes it harder for
 unrelated processes to stumble onto the wrong session.
 
@@ -377,25 +377,25 @@ ambiguous state.
 set -euo pipefail
 
 # Start both
-tui-driver -q gemini start
+tui-driver -q agy start
 tui-driver -q claude start
 
 # Ask both the same question (async)
-tui-driver -q gemini send-async "List 5 uses of Fourier transforms"
+tui-driver -q agy send-async "List 5 uses of Fourier transforms"
 tui-driver -q claude send-async "List 5 uses of Fourier transforms"
 
 # Wait for both
-gemini_response=$(tui-driver -q gemini poll --wait)
+agy_response=$(tui-driver -q agy poll --wait)
 claude_response=$(tui-driver -q claude poll --wait)
 
-echo "=== Gemini ==="
-echo "$gemini_response"
+echo "=== Antigravity ==="
+echo "$agy_response"
 echo ""
 echo "=== Claude ==="
 echo "$claude_response"
 
 # Clean up
-tui-driver gemini stop
+tui-driver agy stop
 tui-driver claude stop
 ```
 
@@ -405,17 +405,17 @@ tui-driver claude stop
 #!/usr/bin/env bash
 set -euo pipefail
 
-tui-driver -q gemini start
-tui-driver -q gemini send-async "Write a detailed analysis of merge sort"
+tui-driver -q agy start
+tui-driver -q agy send-async "Write a detailed analysis of merge sort"
 
 # Poll every 5 seconds, do other work in between
-while ! tui-driver -q gemini poll 2>/dev/null; do
+while ! tui-driver -q agy poll 2>/dev/null; do
     echo "Still waiting... doing other work"
     sleep 5
 done
 
 # Response was printed to stdout by the successful poll
-tui-driver gemini stop
+tui-driver agy stop
 ```
 
 ## License

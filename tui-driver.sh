@@ -7,10 +7,12 @@
 #   tui-driver <tui-command> respond "y"
 #   tui-driver <tui-command> stop | status | raw
 #
-# The first argument is always the TUI command (gemini, claude, aichat, etc).
+# The first argument is always the TUI command (agy, claude, aichat, etc).
 # No profiles, no special-casing. Works with any TUI.
 
 set -euo pipefail
+
+VERSION="0.2.0"
 
 # ---------------------------------------------------------------------------
 # Dependency check
@@ -52,6 +54,7 @@ while [[ "${1:-}" == --* || "${1:-}" == -* ]]; do
         --dir)     WORK_DIR="$2"; shift 2 ;;
         --quiet|-q) QUIET="true"; shift ;;
         --help|-h) set -- "help"; break ;;
+        --version|-v) set -- "version"; break ;;
         *)         echo "Unknown flag: $1" >&2; exit 1 ;;
     esac
 done
@@ -64,7 +67,7 @@ case "$TUI_CMD" in
     help|--help|-h|"")
         ACTION="help"
         ;;
-    install|uninstall)
+    install|uninstall|version)
         ACTION="$TUI_CMD"
         TUI_CMD=""
         ;;
@@ -554,6 +557,10 @@ cmd_raw() {
 INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_NAME="tui-driver"
 
+cmd_version() {
+    echo "tui-driver ${VERSION}"
+}
+
 cmd_install() {
     local src dst
     src="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
@@ -566,7 +573,7 @@ cmd_install() {
         log "WARNING: ${INSTALL_DIR} is not in your PATH."
         log "Add to ~/.bashrc or ~/.zshrc:  export PATH=\"${INSTALL_DIR}:\$PATH\""
     else
-        log "You can now run: tui-driver gemini start"
+        log "You can now run: tui-driver agy start"
     fi
 }
 
@@ -591,6 +598,7 @@ case "$ACTION" in
     raw)        cmd_raw ;;
     install)    cmd_install ;;
     uninstall)  cmd_uninstall ;;
+    version)    cmd_version ;;
     help|*)
         cat >&2 <<'USAGE'
 tui-driver - Drive any interactive TUI programmatically via tmux
@@ -610,11 +618,13 @@ Actions:
   raw               Raw screen capture (for debugging)
   install           Copy to ~/.local/bin as 'tui-driver'
   uninstall         Remove from ~/.local/bin
+  version           Print the tui-driver version
 
 Flags:
   --session NAME    Override tmux session name (default: tui-<command>)
   --dir DIR         Set the working directory
   --quiet, -q       Suppress stderr logs (saves tokens for agents)
+  --version, -v     Print the tui-driver version
 
 Environment (override any default):
   TUI_POLL          poll interval        (default: 2s)
@@ -629,9 +639,9 @@ Environment (override any default):
   TUI_QUIET         suppress logs        (default: false)
 
 Examples:
-  tui-driver gemini start
-  tui-driver gemini send "Explain this code"
-  tui-driver gemini stop
+  tui-driver agy start
+  tui-driver agy send "Explain this code"
+  tui-driver agy stop
 
   tui-driver claude start
   tui-driver claude send "What does this repo do?"
@@ -642,9 +652,9 @@ Examples:
   tui-driver aichat stop
 
 Async (non-blocking) usage:
-  tui-driver gemini send-async "Search for KiCad 10 changelog"
-  tui-driver gemini poll            # returns "waiting" or the response
-  tui-driver gemini poll --wait     # blocks until response is ready
+  tui-driver agy send-async "Search for KiCad 10 changelog"
+  tui-driver agy poll            # returns "waiting" or the response
+  tui-driver agy poll --wait     # blocks until response is ready
 USAGE
         ;;
 esac
