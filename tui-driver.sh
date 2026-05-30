@@ -43,6 +43,7 @@ TERM_HEIGHT="${TUI_HEIGHT:-50}"
 MIN_INTERVAL="${TUI_MIN_INTERVAL:-3}"   # minimum seconds between sends
 JITTER="${TUI_JITTER:-2}"               # random 0..JITTER seconds added
 QUIET="${TUI_QUIET:-false}"             # suppress stderr logs (for agents)
+SESSION_EXPLICIT=false                   # true once --session NAME is given
 
 # ---------------------------------------------------------------------------
 # Parse arguments: tui-driver [flags] <tui-command> <action> [args]
@@ -50,7 +51,7 @@ QUIET="${TUI_QUIET:-false}"             # suppress stderr logs (for agents)
 
 while [[ "${1:-}" == --* || "${1:-}" == -* ]]; do
     case "$1" in
-        --session) TUI_SESSION="$2"; shift 2 ;;
+        --session) TUI_SESSION="$2"; SESSION_EXPLICIT=true; shift 2 ;;
         --dir)     WORK_DIR="$2"; shift 2 ;;
         --quiet|-q) QUIET="true"; shift ;;
         --help|-h) set -- "help"; break ;;
@@ -67,7 +68,7 @@ case "$TUI_CMD" in
     help|--help|-h|"")
         ACTION="help"
         ;;
-    install|uninstall|version)
+    install|uninstall|version|list|reap)
         ACTION="$TUI_CMD"
         TUI_CMD=""
         ;;
@@ -101,7 +102,19 @@ _default_session() {
     # New session: random suffix to avoid collisions with other callers
     echo "tui-${TUI_CMD}-${RANDOM}${RANDOM}"
 }
-TUI_SESSION="${TUI_SESSION:-$(_default_session)}"
+# Explicit "--session NAME" is a full escape hatch: it bypasses the cmd+dir
+# lock entirely, so multiple agents in the SAME directory can each drive their
+# own independent session. Default (no --session) sessions stay keyed on
+# cmd+dir via the lock, so separate start/send/stop invocations rediscover the
+# same session. The global actions (list/reap/install/...) need no session.
+case "$ACTION" in
+    help|install|uninstall|version|list|reap) : ;;
+    *)
+        if [ -z "${TUI_SESSION:-}" ]; then
+            TUI_SESSION="$(_default_session)"
+        fi
+        ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -109,7 +122,7 @@ TUI_SESSION="${TUI_SESSION:-$(_default_session)}"
 
 log() {
     [[ "$QUIET" == "true" ]] && return
-    printf '[tui-driver:%s] %s\n' "$TUI_SESSION" "$*" >&2
+    printf '[tui-driver:%s] %s\n' "${TUI_SESSION:-tui-driver}" "$*" >&2
 }
 
 _stamp_file()    { echo "/tmp/.tui-driver-${TUI_SESSION}.stamp"; }
@@ -128,16 +141,30 @@ _lock_file() {
     echo "/tmp/.tui-driver-${TUI_CMD}-${dir_hash}.lock"
 }
 
+_rm_owned_lock() {
+    # Remove the cmd+dir lock ONLY if it still names the given session.
+    # This stops one caller from clobbering another same-dir caller's lock,
+    # and makes explicit --session callers (which never write the lock) safe
+    # no-ops here.
+    local owner="$1" lock
+    lock=$(_lock_file)
+    if [ -f "$lock" ] && [ "$(cat "$lock" 2>/dev/null)" = "$owner" ]; then
+        rm -f "$lock"
+    fi
+    return 0
+}
+
 _start_watchdog() {
     # Background process that kills the tmux session if nobody has used it
     # for a while (meaning the caller likely died).  We track activity via
     # the stamp file: every send/respond updates it.  If no activity for
     # WATCHDOG_TIMEOUT seconds, assume the caller is gone and clean up.
     local session="$TUI_SESSION"
-    local stamp lock watchdog
+    local stamp watchdog async poll_hash
     stamp=$(_stamp_file)
-    lock=$(_lock_file)
     watchdog=$(_watchdog_file)
+    async=$(_async_file)
+    poll_hash=$(_poll_hash_file)
     local timeout="${TUI_WATCHDOG:-600}"  # 10 minutes default
 
     # Seed the stamp so the watchdog has a starting point
@@ -146,8 +173,11 @@ _start_watchdog() {
     (
         while true; do
             sleep 30
-            # If session no longer exists, we're done
+            # If the session is gone (stopped, crashed, killed elsewhere),
+            # clean up our own per-session state so it does not leak into /tmp.
             if ! tmux has-session -t "$session" 2>/dev/null; then
+                rm -f "$stamp" "$async" "$poll_hash" "$watchdog"
+                _rm_owned_lock "$session"
                 break
             fi
             # Check if stamp file has been updated recently
@@ -158,13 +188,15 @@ _start_watchdog() {
                 idle=$((now - last))
                 if [ "$idle" -gt "$timeout" ]; then
                     tmux kill-session -t "$session" 2>/dev/null || true
-                    rm -f "$stamp" "$lock" "$watchdog"
+                    rm -f "$stamp" "$async" "$poll_hash" "$watchdog"
+                    _rm_owned_lock "$session"
                     break
                 fi
             else
                 # No stamp file — caller probably died without stopping
                 tmux kill-session -t "$session" 2>/dev/null || true
-                rm -f "$lock" "$watchdog"
+                rm -f "$async" "$poll_hash" "$watchdog"
+                _rm_owned_lock "$session"
                 break
             fi
         done
@@ -298,24 +330,31 @@ cmd_start() {
         return 1
     fi
 
-    # Prevent starting if another tui-driver session exists (any TUI)
-    local lock
-    lock=$(_lock_file)
-    if [ -f "$lock" ]; then
-        local existing
-        existing=$(cat "$lock")
-        if tmux has-session -t "$existing" 2>/dev/null; then
-            log "Error: another session '$existing' is already running."
-            log "Run 'tui-driver $TUI_CMD stop' first."
-            return 1
+    # Default sessions are keyed on cmd+dir via a lock so later send/stop
+    # invocations rediscover them, and only one default session per cmd+dir is
+    # allowed. Explicit --session sessions skip the lock entirely, so multiple
+    # agents can drive the same command from the same directory independently.
+    local lock=""
+    if [ "$SESSION_EXPLICIT" = false ]; then
+        lock=$(_lock_file)
+        if [ -f "$lock" ]; then
+            local existing
+            existing=$(cat "$lock")
+            if tmux has-session -t "$existing" 2>/dev/null; then
+                log "Error: another session '$existing' is already running for this command+directory."
+                log "Run 'tui-driver $TUI_CMD stop' first, or pass --session NAME to start a second, independent session."
+                return 1
+            fi
+            rm -f "$lock"  # stale lock
         fi
-        rm -f "$lock"  # stale lock
     fi
 
     log "Creating tmux session '$TUI_SESSION' ..."
     tmux new-session -s "$TUI_SESSION" -d -x "$TERM_WIDTH" -y "$TERM_HEIGHT"
     tmux send-keys -t "$TUI_SESSION" "cd $(printf '%q' "$WORK_DIR") && $TUI_CMD" Enter
-    echo "$TUI_SESSION" > "$lock"
+    if [ "$SESSION_EXPLICIT" = false ]; then
+        echo "$TUI_SESSION" > "$lock"
+    fi
 
     # Spawn a watchdog that kills the session if the caller dies.
     _start_watchdog
@@ -539,7 +578,8 @@ cmd_stop() {
     else
         log "No session to stop"
     fi
-    rm -f "$(_stamp_file)" "$(_lock_file)" "$(_async_file)" "$(_poll_hash_file)"
+    rm -f "$(_stamp_file)" "$(_async_file)" "$(_poll_hash_file)"
+    _rm_owned_lock "$TUI_SESSION"
 }
 
 cmd_status() {
@@ -552,6 +592,118 @@ cmd_status() {
 
 cmd_raw() {
     _capture
+}
+
+# ---------------------------------------------------------------------------
+# Orphan discovery and cleanup (global — across all dirs and commands).
+#
+# Every session tui-driver starts gets a per-session watchdog file
+# (/tmp/.tui-driver-<session>.watchdog) holding the watchdog PID. That set of
+# files is the authoritative registry of tui-driver-managed sessions — more
+# reliable than matching tmux names, and it works for custom --session names.
+#
+# A session is an ORPHAN (safe to reap) only if BOTH hold:
+#   * its watchdog process is dead (no auto-cleanup will ever run again), AND
+#   * it has been idle longer than TUI_WATCHDOG seconds.
+# A live parallel agent always has a live watchdog PID, so it is never reaped.
+# ---------------------------------------------------------------------------
+
+_watchdog_alive() {
+    local pid="$1"
+    [ -n "$pid" ] && [ "$pid" != "none" ] && kill -0 "$pid" 2>/dev/null
+}
+
+_iter_managed_sessions() {
+    # Emit "session<TAB>watchdog_pid<TAB>idle_seconds<TAB>alive(0/1)" per line.
+    # idle_seconds is -1 when no stamp exists.
+    local wd session pid stamp last now idle alive
+    now=$(date +%s)
+    shopt -s nullglob
+    for wd in /tmp/.tui-driver-*.watchdog; do
+        session=${wd#/tmp/.tui-driver-}
+        session=${session%.watchdog}
+        pid=$(cat "$wd" 2>/dev/null || echo "none")
+        [ -n "$pid" ] || pid="none"
+        stamp="/tmp/.tui-driver-${session}.stamp"
+        if [ -f "$stamp" ]; then
+            last=$(cat "$stamp" 2>/dev/null || echo "$now")
+            idle=$((now - last))
+        else
+            idle=-1
+        fi
+        if tmux has-session -t "$session" 2>/dev/null; then alive=1; else alive=0; fi
+        printf '%s\t%s\t%s\t%s\n' "$session" "$pid" "$idle" "$alive"
+    done
+    shopt -u nullglob
+}
+
+_clear_session_state() {
+    local session="$1"
+    rm -f "/tmp/.tui-driver-${session}.stamp" \
+          "/tmp/.tui-driver-${session}.watchdog" \
+          "/tmp/.tui-driver-${session}.async" \
+          "/tmp/.tui-driver-${session}.poll-hash"
+    # Drop any cmd+dir lock that still points at this (dead) session.
+    local lf
+    shopt -s nullglob
+    for lf in /tmp/.tui-driver-*.lock; do
+        if [ "$(cat "$lf" 2>/dev/null)" = "$session" ]; then
+            rm -f "$lf"
+        fi
+    done
+    shopt -u nullglob
+}
+
+cmd_list() {
+    local any=false session pid idle alive wdstate status
+    printf '%-30s %-10s %-9s %s\n' "SESSION" "WATCHDOG" "IDLE(s)" "STATUS"
+    while IFS=$'\t' read -r session pid idle alive; do
+        any=true
+        if _watchdog_alive "$pid"; then wdstate="alive"; else wdstate="dead"; fi
+        if [ "$alive" = 0 ]; then
+            status="dead (leaked state — reap clears it)"
+        elif [ "$wdstate" = alive ]; then
+            status="managed (live)"
+        elif [ "$idle" -ge "${TUI_WATCHDOG:-600}" ]; then
+            status="ORPHAN (reap will kill)"
+        else
+            status="unmanaged (recently active — kept)"
+        fi
+        printf '%-30s %-10s %-9s %s\n' "$session" "$pid" "$idle" "$status"
+    done < <(_iter_managed_sessions)
+    if [ "$any" != true ]; then
+        echo "(no tui-driver sessions)"
+    fi
+}
+
+cmd_reap() {
+    local threshold="${TUI_WATCHDOG:-600}"
+    local session pid idle alive reaped=0 skipped=0
+    while IFS=$'\t' read -r session pid idle alive; do
+        if [ "$alive" = 0 ]; then
+            # Session already gone — just clear leaked state files.
+            _clear_session_state "$session"
+            log "cleared leaked state for dead session '$session'"
+            reaped=$((reaped + 1))
+            continue
+        fi
+        if _watchdog_alive "$pid"; then
+            log "skipping '$session': watchdog PID $pid alive (managed/live agent)"
+            skipped=$((skipped + 1))
+            continue
+        fi
+        if [ "$idle" -lt 0 ] || [ "$idle" -lt "$threshold" ]; then
+            log "skipping '$session': watchdog dead but idle ${idle}s < ${threshold}s (may still be in use)"
+            skipped=$((skipped + 1))
+            continue
+        fi
+        # Dead watchdog AND idle past threshold → true orphan.
+        tmux kill-session -t "$session" 2>/dev/null || true
+        _clear_session_state "$session"
+        log "reaped orphan session '$session' (idle ${idle}s, watchdog dead)"
+        reaped=$((reaped + 1))
+    done < <(_iter_managed_sessions)
+    log "reap complete: ${reaped} reaped/cleared, ${skipped} skipped"
 }
 
 INSTALL_DIR="${HOME}/.local/bin"
@@ -596,6 +748,8 @@ case "$ACTION" in
     stop)       cmd_stop ;;
     status)     cmd_status ;;
     raw)        cmd_raw ;;
+    list)       cmd_list ;;
+    reap)       cmd_reap ;;
     install)    cmd_install ;;
     uninstall)  cmd_uninstall ;;
     version)    cmd_version ;;
@@ -616,12 +770,18 @@ Actions:
   stop              Kill the session
   status            Print running / stopped
   raw               Raw screen capture (for debugging)
+  list              List all tui-driver sessions (any dir/command) + status
+  reap              Kill orphaned sessions (dead watchdog + idle); never
+                    touches live or recently-active sessions
   install           Copy to ~/.local/bin as 'tui-driver'
   uninstall         Remove from ~/.local/bin
   version           Print the tui-driver version
 
 Flags:
-  --session NAME    Override tmux session name (default: tui-<command>)
+  --session NAME    Use an independent named session (escape hatch): bypasses
+                    the per-directory lock so multiple agents can drive the
+                    same command from the same directory in parallel. Pass the
+                    same NAME to every send/respond/poll/stop for that session.
   --dir DIR         Set the working directory
   --quiet, -q       Suppress stderr logs (saves tokens for agents)
   --version, -v     Print the tui-driver version

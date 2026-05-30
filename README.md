@@ -153,6 +153,51 @@ Notes:
 - `stop` will kill the session you attached to, so use plain `tmux kill-session
   -t mysession` (or just detach) if you want to keep it alive.
 
+### Multiple agents in parallel (same command, same directory)
+
+By default, a session is keyed on the **TUI command + working directory**: a
+`start` records a lock so that later `send`/`stop` calls — even from a separate
+process — rediscover the same session without you passing a name around. The
+flip side is that two callers driving the same command from the same directory
+would otherwise share one session (the second `start` errors, and a blind
+`send` lands in the first caller's session).
+
+When you need genuinely independent sessions — e.g. several AI agents each
+driving `agy` in the same repo — give each one its own `--session NAME`. That
+bypasses the lock entirely:
+
+```bash
+# Agent 1
+tui-driver --session agent1 agy start
+tui-driver --session agent1 agy send "Summarise file A"
+tui-driver --session agent1 agy stop
+
+# Agent 2 — same directory, fully independent, runs concurrently
+tui-driver --session agent2 agy start
+tui-driver --session agent2 agy send "Summarise file B"
+tui-driver --session agent2 agy stop
+```
+
+Each named session keeps its own state and watchdog; they never collide.
+
+### Listing and reaping sessions
+
+Every session tui-driver starts is watched by a background watchdog that
+auto-kills it after `TUI_WATCHDOG` seconds of inactivity (in case the caller
+dies). If a watchdog itself dies (reboot, OOM, kill), its session can be left
+orphaned. `list` and `reap` handle discovery and cleanup across **all**
+directories and commands:
+
+```bash
+tui-driver list   # show every session, its watchdog state, idle time, status
+tui-driver reap   # kill true orphans and clear any leaked state files
+```
+
+`reap` is conservative and safe to run while other agents are working: it only
+kills a session when its watchdog process is **dead** *and* it has been idle
+longer than `TUI_WATCHDOG`. A live agent always has a live watchdog, so it is
+never touched — anything skipped is logged.
+
 ### Quiet mode (for AI agents)
 
 Suppress stderr logs to save tokens when an AI agent is the caller:
@@ -230,14 +275,20 @@ tui-driver agy status   # prints "running" or "stopped"
 | `stop` | Kill session and clean up | No | 0 |
 | `status` | Print `running` or `stopped` | No | 0 |
 | `raw` | Dump raw screen content | No | 0 |
+| `list` | List all tui-driver sessions (any dir/command) and their status | No | 0 |
+| `reap` | Kill orphaned sessions and clear leaked state (see below) | No | 0 |
 | `install` | Copy to `~/.local/bin` | No | 0 |
 | `uninstall` | Remove from `~/.local/bin` | No | 0 |
+
+`list` and `reap` are global — they operate across every working directory
+and TUI command, so you can inspect or clean up sessions you started from
+elsewhere (or that were orphaned when a caller died).
 
 ### Flags
 
 | Flag | Description |
 |------|-------------|
-| `--session NAME` | Override the auto-generated tmux session name |
+| `--session NAME` | Run an independent named session. Bypasses the per-directory lock, so multiple agents can drive the same command from the same directory in parallel (see below). Pass the same NAME to every `send`/`respond`/`poll`/`stop`. |
 | `--dir DIR` | Set the working directory for the TUI process |
 | `--quiet`, `-q` | Suppress stderr logs |
 
@@ -332,12 +383,22 @@ If the calling process dies without running `stop`, the tmux session
 would linger forever. tui-driver spawns a background watchdog that
 monitors a timestamp file:
 
-- Every `send`, `respond`, or `poll` updates the timestamp.
+- Every `send`, `respond`, or `poll` updates the timestamp — and while a
+  blocking call is *waiting* for a response, its poll loop keeps refreshing
+  the timestamp too, so a long-running response is never mistaken for a dead
+  caller (`TUI_TIMEOUT` bounds a single response; `TUI_WATCHDOG` bounds caller
+  absence).
 - The watchdog checks every 30 seconds.
 - If no activity for `TUI_WATCHDOG` seconds (default: 10 minutes), it
   kills the session and removes all temp files.
 
 This is essential for agent workflows where crashes are expected.
+
+If a watchdog itself dies (reboot, OOM, kill), its session can be orphaned.
+`tui-driver list` shows every session and its state across all directories, and
+`tui-driver reap` cleans up orphans — but only sessions whose watchdog is dead
+**and** which have been idle past `TUI_WATCHDOG`, so live agents are never
+touched.
 
 ### Bracketed paste
 
