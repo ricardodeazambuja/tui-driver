@@ -13,6 +13,10 @@
 set -euo pipefail
 
 VERSION="0.2.0"
+# Baked in at install time by cmd_install (git short hash, +-dirty if the
+# source tree had uncommitted changes). Empty when running straight from a
+# checkout, in which case _build_stamp falls back to live git.
+BUILD_STAMP=""
 
 # ---------------------------------------------------------------------------
 # Dependency check
@@ -728,18 +732,46 @@ cmd_reap() {
 INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_NAME="tui-driver"
 
+# Produce a git build stamp: prefer the value baked in at install time; when
+# running from a checkout, derive it live from the source tree.
+_git_stamp() {
+    local dir="$1" hash
+    hash=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null) || return 1
+    [ -n "$hash" ] || return 1
+    if ! git -C "$dir" diff --quiet --ignore-submodules HEAD 2>/dev/null; then
+        hash="${hash}-dirty"
+    fi
+    printf '%s' "$hash"
+}
+
+_build_stamp() {
+    if [ -n "$BUILD_STAMP" ]; then
+        printf '%s' "$BUILD_STAMP"
+        return 0
+    fi
+    _git_stamp "$(cd "$(dirname "$0")" && pwd)" 2>/dev/null || printf 'unknown'
+}
+
 cmd_version() {
-    echo "tui-driver ${VERSION}"
+    echo "tui-driver ${VERSION} ($(_build_stamp))"
 }
 
 cmd_install() {
     local src dst
-    src="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    local srcdir stamp
+    srcdir="$(cd "$(dirname "$0")" && pwd)"
+    src="${srcdir}/$(basename "$0")"
     dst="${INSTALL_DIR}/${INSTALL_NAME}"
     mkdir -p "$INSTALL_DIR"
     cp "$src" "$dst"
     chmod +x "$dst"
-    log "Installed to $dst"
+    # Bake the source tree's git stamp into the installed copy so `version`
+    # reports the exact commit it was built from (the install dir is not a repo).
+    stamp=$(_git_stamp "$srcdir" 2>/dev/null) || stamp=""
+    if [ -n "$stamp" ]; then
+        sed -i "s/^BUILD_STAMP=\"\"/BUILD_STAMP=\"${stamp}\"/" "$dst"
+    fi
+    log "Installed to $dst${stamp:+ (${stamp})}"
     if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
         log "WARNING: ${INSTALL_DIR} is not in your PATH."
         log "Add to ~/.bashrc or ~/.zshrc:  export PATH=\"${INSTALL_DIR}:\$PATH\""
