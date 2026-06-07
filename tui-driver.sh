@@ -474,7 +474,9 @@ cmd_respond() {
 #
 # State files (all per-session, cleaned up by stop/poll-complete):
 #   .async     — prompt text (anchor for _extract_response)
-#   .poll-hash — last screen hash (for single-check poll mode)
+#   .poll-hash — vestigial: older single-check poll persisted the last screen
+#                hash here across calls; the current self-contained probe does
+#                not need it. Still cleaned up so stale files never leak.
 #
 # Designed for AI agents that want to run poll --wait in the background
 # and get notified when the response arrives, freeing them to do other
@@ -559,35 +561,47 @@ cmd_poll() {
         return 1
     fi
 
-    # Non-blocking mode: compare current screen hash to the one saved
-    # from the last poll call. If identical, the screen is stable — extract
-    # and return the response. Otherwise, save the new hash and report
-    # "waiting" (exit 1).
-    local cur_hash prev_hash=""
-    cur_hash=$(_screen_hash)
+    # Non-blocking mode: a SELF-CONTAINED stability probe. Sample the screen
+    # a few times POLL_INTERVAL apart *within this single call* and require
+    # STABLE_COUNT consecutive identical samples — the same stability rule as
+    # _wait_stable, just bounded to a quick probe instead of MAX_WAIT.
+    #
+    # The previous design compared the current screen against the hash saved
+    # by the *prior* poll call. That had two sharp edges: (1) the first poll
+    # after send-async always reported "waiting" (there was no prior hash to
+    # match) even when the response was already on screen, and (2) a single
+    # poll could never clear a stale .async lock, so an interrupted poll/--wait
+    # left the lock wedged and the next send-async failed with "already
+    # pending". Probing within the call fixes both: a lone poll now detects an
+    # already-finished response and always clears the lock when it returns the
+    # answer. Worst case (still moving) the probe costs STABLE_COUNT *
+    # POLL_INTERVAL seconds before reporting "waiting".
+    local prev_hash="" cur_hash stable=0 i
+    for (( i=0; i<=STABLE_COUNT; i++ )); do
+        [ "$i" -gt 0 ] && sleep "$POLL_INTERVAL"
+        cur_hash=$(_screen_hash)
+        _stamp  # each sample is caller-liveness proof for the watchdog
 
-    if [ -f "$poll_hash_file" ]; then
-        prev_hash=$(cat "$poll_hash_file")
-    fi
+        if [ "$cur_hash" = "$prev_hash" ]; then
+            stable=$((stable + 1))
+        else
+            stable=0
+        fi
+        prev_hash="$cur_hash"
 
-    echo "$cur_hash" > "$poll_hash_file"
+        if [ "$stable" -ge "$STABLE_COUNT" ]; then
+            log "Screen stable"
+            _extract_response "$prompt"
+            tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
+            rm -f "$async_file" "$poll_hash_file"
+            return 0
+        fi
+    done
 
-    if [ "$cur_hash" = "$prev_hash" ]; then
-        log "Screen stable"
-        _extract_response "$prompt"
-        tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
-        rm -f "$async_file" "$poll_hash_file"
-        _stamp
-        return 0
-    fi
-
-    # Still changing. Refresh the stamp so each poll counts as caller liveness.
-    # Note: this only beats at the moments polls happen — a manual poller that
-    # does more than TUI_WATCHDOG seconds of work *between* polls can still be
-    # reaped (not polling is not demonstrable liveness). For long async waits,
-    # prefer `poll --wait` in the background, which heartbeats continuously via
-    # _wait_stable.
-    _stamp
+    # Still changing after the probe. The per-sample _stamp above already
+    # refreshed liveness. The caller should poll again later; for long async
+    # waits prefer `poll --wait` in the background, which heartbeats
+    # continuously via _wait_stable.
     log "Still waiting ..."
     echo "waiting"
     return 1
@@ -864,8 +878,29 @@ Examples:
 
 Async (non-blocking) usage:
   tui-driver agy send-async "Search for KiCad 10 changelog"
-  tui-driver agy poll            # returns "waiting" or the response
+  tui-driver agy poll            # returns "waiting" or the full response
   tui-driver agy poll --wait     # blocks until response is ready
+
+How poll works (read this before driving from an agent):
+  * Only ONE send-async may be pending per session. A second send-async
+    while one is pending fails with "already pending" until you retrieve
+    the first response with poll/poll --wait.
+  * poll is self-contained: a single call samples the screen until it is
+    stable, then prints the WHOLE response (exit 0) — or "waiting" (exit 1)
+    if still changing. You do NOT need to call it twice. Retrieving a
+    response is what clears the pending lock.
+  * For long-running queries, run `poll --wait` in the BACKGROUND and keep
+    working; it blocks until the response lands (up to TUI_TIMEOUT).
+  * Do NOT inspect a pending query with `raw` to "check progress" — raw
+    never consumes the response or clears the lock, so the query stays
+    pending. Use poll/poll --wait to retrieve, raw only for debugging.
+  * Tune stability if responses get clipped or never settle: raise
+    TUI_STABLE (more consecutive stable samples) or TUI_POLL (longer gap).
+
+Recovering a stuck or orphaned session:
+  tui-driver list                # show every session + state (all dirs)
+  tui-driver agy reap            # clear crashed/idle orphans (never a live one)
+  tui-driver agy stop && tui-driver agy start   # force-restart a wedged session
 USAGE
         ;;
 esac

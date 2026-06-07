@@ -83,8 +83,24 @@ with other work — you'll be notified when the response arrives.
 
 **If you need to check without blocking** (e.g. to peek at progress):
 ```bash
-tui-driver agy poll    # prints "waiting" if not ready, or the response
+tui-driver agy poll    # prints "waiting" if not ready, or the full response
 ```
+
+**How `poll` behaves (so you don't get stuck):**
+- Only **one** `send-async` can be pending per session at a time. If you try
+  to send another while one is pending, you'll get `already pending` — you
+  must retrieve the first response (with `poll` or `poll --wait`) before
+  sending again. Retrieving the response is what releases the lock.
+- A single `poll` is **self-contained**: one call returns the *whole*
+  response when the screen is stable (exit 0), or `waiting` (exit 1) if it's
+  still generating. You never need to call `poll` twice in a row.
+- **Never use `raw` to "monitor" a pending query.** `raw` does not consume the
+  response or release the lock, so the query stays pending and your next send
+  fails. Use `poll`/`poll --wait` to retrieve; use `raw` only for debugging a
+  session that already misbehaves.
+- If a query seems to return clipped or empty output, raise `TUI_STABLE`
+  (more consecutive stable samples) or `TUI_POLL` (longer gap between samples)
+  on that invocation, e.g. `TUI_STABLE=3 tui-driver -q agy poll --wait`.
 
 ### Web Search Examples
 

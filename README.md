@@ -285,7 +285,7 @@ tui-driver agy status   # prints "running" or "stopped"
 | `start` | Launch TUI in tmux, wait for it to be ready | Yes | 0 = ready, 1 = timeout |
 | `send "prompt"` | Send prompt, wait for response | Yes | 0 = stable, 1 = timeout |
 | `send-async "prompt"` | Send prompt, return immediately | No | 0 = sent, 1 = error |
-| `poll` | Single check: is the async response ready? | No | 0 = ready, 1 = still changing |
+| `poll` | Self-contained stability probe (~`TUI_STABLE`×`TUI_POLL`s): returns the full response if ready, else `waiting` | Brief | 0 = ready, 1 = still changing |
 | `poll --wait` | Block until async response is ready | Yes | 0 = stable, 1 = timeout |
 | `respond "reply"` | Send a short reply (e.g. `y`, `n`, `""`) | Yes | 0 = stable, 1 = timeout |
 | `stop` | Kill session and clean up | No | 0 |
@@ -439,8 +439,11 @@ workflows:
 
 - `send-async` fires the prompt and returns immediately, so the agent
   can schedule other work.
-- `poll` does a single non-blocking check (one hash comparison), ideal
-  for polling loops.
+- `poll` does a self-contained stability probe: within the single call it
+  samples the screen a few times (`TUI_STABLE` samples, `TUI_POLL` apart) and
+  returns the full response the moment the screen is stable, or `waiting` if
+  it's still changing. One call is enough — you never need a priming poll, and
+  retrieving the response is what clears the pending lock.
 - `poll --wait` blocks until the response is ready, intended to run in
   the background so the agent gets notified on completion.
 
