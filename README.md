@@ -276,6 +276,26 @@ Check whether a session is running:
 tui-driver agy status   # prints "running" or "stopped"
 ```
 
+## Bundled skills (for Claude Code)
+
+The `skills/` directory ships ready-to-use [Claude Code](https://claude.com/claude-code)
+skills that drive a TUI through `tui-driver`. Drop one into your project's (or
+`~/.claude/`) `skills/` directory and Claude Code will load it automatically.
+
+- **`antigravity-web`** — web search, URL fetching, and online-document reading
+  via an Antigravity CLI (`agy`) session: grounded Google Search with
+  citations, JavaScript-rendered pages, and PDF/datasheet extraction that the
+  built-in fetch can't handle. Use it in place of the built-in WebSearch/WebFetch.
+- **`claude-delegate`** — hand a self-contained task to an *independent*
+  `claude` CLI session (its own fresh context window) and collect the result:
+  for isolated sub-tasks you don't want bloating your own context, genuinely
+  parallel fire-and-poll work, or a second opinion. Runs under the same login
+  and usage pool as your current session — not a separate bill.
+
+Both follow the same `send-async` + `poll --wait` (in background) pattern
+described above and include session-recovery steps. See each
+`skills/<name>/SKILL.md` for full usage.
+
 ## Full API reference
 
 ### Actions
