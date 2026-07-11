@@ -12,6 +12,34 @@ echo "$response"
 tui-driver agy stop
 ```
 
+## Why AI agents?
+
+tui-driver works for any TUI, but it was built for one use case in
+particular: letting an **AI agent drive other AI CLIs as sub-agents**.
+An agent such as Claude Code can use it to:
+
+- **Fan out work in parallel.** Fire queries at several sessions with
+  `send-async`, keep working, and collect results with `poll` — whose
+  exit codes (0 = ready, 2 = still working, 3 = timed out but the query
+  stays pending) are designed to be loop conditions in a script.
+- **Isolate context.** Delegate a large, self-contained sub-task to an
+  independent CLI session with its own fresh context window, so the
+  sub-task's output never bloats the orchestrating agent's context.
+- **Cross-check across models and vendors.** Send the same question to
+  `claude`, `agy`, `aichat`, ... side by side and compare answers — a
+  cheap second opinion that no single-vendor API offers.
+- **Monitor without interfering.** `progress` answers "is it still
+  working?" read-only, any number of times, without consuming the
+  pending response.
+- **Survive crashes.** Every session has a watchdog that cleans up when
+  its caller dies, and `list` / `reap` recover orphans — an agent that
+  gets killed mid-task never leaks tmux sessions.
+
+The [bundled skills](#bundled-skills-for-claude-code) package two of
+these patterns ready-to-use for Claude Code, and the
+[examples](#example-orchestrating-two-ai-tools-from-a-script) at the
+bottom show the raw scripting patterns.
+
 ## How it works
 
 1. **start** launches the TUI inside a tmux session.
@@ -369,6 +397,7 @@ described above and include session-recovery steps. See each
 | `reap` | Kill orphaned sessions and clear leaked state (see below) | No | 0 |
 | `install` | Copy to `~/.local/bin` | No | 0 |
 | `uninstall` | Remove from `~/.local/bin` | No | 0 |
+| `version` | Print the tui-driver version (includes a git build stamp when run from a checkout) | No | 0 |
 
 Exit code 1 always means a hard error (no session, no pending async, bad
 usage) and is explained on stderr — even under `--quiet`. Code 2 means
@@ -387,6 +416,7 @@ elsewhere (or that were orphaned when a caller died).
 | `--dir DIR` | Set the working directory for the TUI process |
 | `--until REGEX` | Treat the response as complete the moment REGEX appears in it (see "Exact completion with a marker") |
 | `--quiet`, `-q` | Suppress stderr progress logs (errors are always shown) |
+| `--version`, `-v` | Print the tui-driver version |
 
 ### Environment variables
 
@@ -597,6 +627,20 @@ done
 # Response was printed to stdout by the successful poll
 tui-driver agy stop
 ```
+
+## Testing
+
+The repo ships a self-contained smoke test that exercises the full
+lifecycle (start/send/async/poll/dialog/`--until`/timeout/cleanup)
+against tiny synthetic TUIs — no AI CLI needed, just tmux and python3:
+
+```bash
+./test/smoke.sh                  # test the repo script
+TD=tui-driver ./test/smoke.sh    # test an installed copy
+```
+
+It uses throwaway `--session` names only, so it is safe to run while
+real sessions are active.
 
 ## License
 
