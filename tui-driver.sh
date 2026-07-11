@@ -48,6 +48,8 @@ MIN_INTERVAL="${TUI_MIN_INTERVAL:-3}"   # minimum seconds between sends
 JITTER="${TUI_JITTER:-2}"               # random 0..JITTER seconds added
 PASTE_DELAY="${TUI_PASTE_DELAY:-0.5}"   # pause between paste and Enter
 START_TIMEOUT="${TUI_START_TIMEOUT:-60}" # max wait for the TUI to come up
+HEARTBEAT="${TUI_HEARTBEAT:-15}"        # "still waiting" log every N s (0=off)
+DONE_PATTERN="${TUI_DONE_PATTERN:-}"    # regex in the response = done (opt-in)
 QUIET="${TUI_QUIET:-false}"             # suppress stderr logs (for agents)
 SESSION_EXPLICIT=false                   # true once --session NAME is given
 
@@ -59,6 +61,7 @@ while [[ "${1:-}" == --* || "${1:-}" == -* ]]; do
     case "$1" in
         --session) TUI_SESSION="$2"; SESSION_EXPLICIT=true; shift 2 ;;
         --dir)     WORK_DIR="$2"; shift 2 ;;
+        --until)   DONE_PATTERN="$2"; shift 2 ;;
         --quiet|-q) QUIET="true"; shift ;;
         --help|-h) set -- "help"; break ;;
         --version|-v) set -- "version"; break ;;
@@ -271,11 +274,16 @@ _screen_hash() {
 }
 
 _wait_stable() {
-    # Wait for the screen to stop changing.
+    # Wait for the screen to stop changing. With DONE_PATTERN set and a
+    # prompt anchor given (send/poll paths), also return the moment the
+    # pattern appears in the extracted response — no stability tail needed.
     local timeout="${1:-$MAX_WAIT}"
+    local prompt="${2:-}"
     local elapsed=0
     local prev_hash=""
     local stable=0
+    local last_change=0
+    local next_beat="$HEARTBEAT"
 
     # Heartbeat: refresh the activity stamp on entry and on every poll below.
     # The active wait loop is proof the caller is still alive, so it holds the
@@ -301,11 +309,25 @@ _wait_stable() {
             stable=$((stable + 1))
         else
             stable=0
+            last_change=$elapsed
         fi
         prev_hash="$cur_hash"
 
+        # grep without -q so python never gets SIGPIPE (pipefail would turn
+        # an early grep exit into a false negative on large responses).
+        if [ -n "$DONE_PATTERN" ] && [ -n "$prompt" ] && \
+           _extract_response "$prompt" | grep -E "$DONE_PATTERN" >/dev/null; then
+            log "Done pattern matched"
+            return 0
+        fi
+
         if [ "$stable" -ge "$STABLE_COUNT" ]; then
             return 0
+        fi
+
+        if [ "$HEARTBEAT" -gt 0 ] && [ "$elapsed" -ge "$next_beat" ]; then
+            log "still waiting — ${elapsed}s elapsed, screen last changed $((elapsed - last_change))s ago"
+            next_beat=$((next_beat + HEARTBEAT))
         fi
 
         sleep "$POLL_INTERVAL"
@@ -313,6 +335,35 @@ _wait_stable() {
     done
 
     return 1
+}
+
+# Shared by send and poll --wait: wait for a stable, NON-EMPTY response.
+# Stability alone is not completion — a TUI that has not started printing
+# yet (backend call, thinking pause before any output) also yields a stable
+# screen, which used to return an empty response with exit 0. Prints the
+# response; returns 0 when ready, 3 on timeout (printing what is on screen).
+_await_response() {
+    local prompt="$1"
+    local t0 waited=0 remaining response
+    t0=$(date +%s)
+    while true; do
+        remaining=$((MAX_WAIT - waited))
+        if _wait_stable "$remaining" "$prompt"; then
+            response=$(_extract_response "$prompt")
+            if [ -n "$response" ]; then
+                log "Screen stabilised"
+                printf '%s\n' "$response"
+                return 0
+            fi
+            log "Screen stable but response still empty — waiting on"
+        fi
+        waited=$(( $(date +%s) - t0 ))
+        if [ "$waited" -ge "$MAX_WAIT" ]; then
+            err "Timeout after ${MAX_WAIT}s - returning what is on screen"
+            _extract_response "$prompt"
+            return 3
+        fi
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -429,19 +480,11 @@ cmd_send() {
 
     log "Prompt sent, waiting for screen to stabilise ..."
 
-    if _wait_stable; then
-        log "Screen stabilised"
-        _extract_response "$prompt"
-        tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
-        _stamp
-        return 0
-    fi
-
-    err "Timeout after ${MAX_WAIT}s - returning what is on screen"
-    _extract_response "$prompt"
+    local rc=0
+    _await_response "$prompt" || rc=$?
     tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
     _stamp
-    return 3
+    return "$rc"
 }
 
 cmd_respond() {
@@ -565,21 +608,12 @@ cmd_poll() {
         # Intended to be run via `Bash(run_in_background)` so the caller
         # gets notified when the response arrives.
         log "Waiting for screen to stabilise (poll --wait) ..."
-        if _wait_stable; then
-            log "Screen stabilised"
-            _extract_response "$prompt"
-            tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
-            rm -f "$async_file" "$poll_hash_file"
-            _stamp
-            return 0
-        fi
-
-        err "Timeout after ${MAX_WAIT}s - returning what is on screen"
-        _extract_response "$prompt"
+        local rc=0
+        _await_response "$prompt" || rc=$?
         tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
         rm -f "$async_file" "$poll_hash_file"
         _stamp
-        return 3
+        return "$rc"
     fi
 
     # Non-blocking mode: a SELF-CONTAINED stability probe. Sample the screen
@@ -870,7 +904,12 @@ Flags:
                     same command from the same directory in parallel. Pass the
                     same NAME to every send/respond/poll/stop for that session.
   --dir DIR         Set the working directory
-  --quiet, -q       Suppress stderr logs (saves tokens for agents)
+  --until REGEX     Treat the response as complete the moment REGEX appears
+                    in it (no stability tail). Word the instruction so the
+                    literal marker is NOT in your prompt, e.g. tell the TUI
+                    "end with the word DONE and three exclamation marks"
+                    and pass --until 'DONE!!!'
+  --quiet, -q       Suppress stderr progress logs (errors still shown)
   --version, -v     Print the tui-driver version
 
 Exit codes:
@@ -887,6 +926,8 @@ Environment (override any default):
   TUI_JITTER        random 0..N jitter   (default: 2s)
   TUI_PASTE_DELAY   paste-to-Enter pause (default: 0.5s)
   TUI_START_TIMEOUT max wait at startup  (default: 60s)
+  TUI_HEARTBEAT     "still waiting" log every N s while blocked (default: 15, 0=off)
+  TUI_DONE_PATTERN  completion regex, same as --until (default: unset)
   TUI_DIR           working dir          (default: cwd)
   TUI_WIDTH         terminal width       (default: 200)
   TUI_HEIGHT        terminal height      (default: 50)
