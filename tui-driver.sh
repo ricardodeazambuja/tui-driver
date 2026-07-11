@@ -50,6 +50,17 @@ PASTE_DELAY="${TUI_PASTE_DELAY:-0.5}"   # pause between paste and Enter
 START_TIMEOUT="${TUI_START_TIMEOUT:-60}" # max wait for the TUI to come up
 HEARTBEAT="${TUI_HEARTBEAT:-15}"        # "still waiting" log every N s (0=off)
 DONE_PATTERN="${TUI_DONE_PATTERN:-}"    # regex in the response = done (opt-in)
+
+# Per-session state lives in a user-private runtime dir, not world-shared
+# /tmp: predictable /tmp names are a symlink/squat risk on shared machines,
+# and tmpfiles cleaners that purge old /tmp entries can delete a live
+# session's stamp — which the watchdog reads as "caller died" and kills the
+# session. XDG_RUNTIME_DIR is per-user 0700 tmpfs; ~/.cache is the fallback.
+# list/reap still scan the legacy /tmp names so sessions started by an older
+# version can be discovered and cleaned up (but not driven — stop/reap them).
+STATE_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache}/tui-driver"
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR" 2>/dev/null || true
 QUIET="${TUI_QUIET:-false}"             # suppress stderr logs (for agents)
 SESSION_EXPLICIT=false                   # true once --session NAME is given
 
@@ -99,7 +110,7 @@ _default_session() {
     else
         dir_hash=$(printf '%s' "$WORK_DIR" | md5 | cut -c1-8)
     fi
-    local lock="/tmp/.tui-driver-${TUI_CMD}-${dir_hash}.lock"
+    local lock="${STATE_DIR}/${TUI_CMD}-${dir_hash}.lock"
     if [ -f "$lock" ]; then
         local existing
         existing=$(cat "$lock")
@@ -140,12 +151,12 @@ err() {
     printf '[tui-driver:%s] %s\n' "${TUI_SESSION:-tui-driver}" "$*" >&2
 }
 
-_stamp_file()    { echo "/tmp/.tui-driver-${TUI_SESSION}.stamp"; }
-_watchdog_file() { echo "/tmp/.tui-driver-${TUI_SESSION}.watchdog"; }
-_async_file()    { echo "/tmp/.tui-driver-${TUI_SESSION}.async"; }
-_poll_hash_file(){ echo "/tmp/.tui-driver-${TUI_SESSION}.poll-hash"; }
-_last_send_file(){ echo "/tmp/.tui-driver-${TUI_SESSION}.last-send"; }
-_prompt_file()   { echo "/tmp/.tui-driver-${TUI_SESSION}.prompt"; }
+_stamp_file()    { echo "${STATE_DIR}/${TUI_SESSION}.stamp"; }
+_watchdog_file() { echo "${STATE_DIR}/${TUI_SESSION}.watchdog"; }
+_async_file()    { echo "${STATE_DIR}/${TUI_SESSION}.async"; }
+_poll_hash_file(){ echo "${STATE_DIR}/${TUI_SESSION}.poll-hash"; }
+_last_send_file(){ echo "${STATE_DIR}/${TUI_SESSION}.last-send"; }
+_prompt_file()   { echo "${STATE_DIR}/${TUI_SESSION}.prompt"; }
 _lock_file() {
     # Lock is keyed on command+directory, NOT session name.
     # This lets _default_session find the right session.
@@ -155,7 +166,7 @@ _lock_file() {
     else
         dir_hash=$(printf '%s' "$WORK_DIR" | md5 | cut -c1-8)
     fi
-    echo "/tmp/.tui-driver-${TUI_CMD}-${dir_hash}.lock"
+    echo "${STATE_DIR}/${TUI_CMD}-${dir_hash}.lock"
 }
 
 _rm_owned_lock() {
@@ -382,14 +393,24 @@ import sys, os
 lines = sys.stdin.read().split("\n")
 prompt = os.environ.get("_TUI_PROMPT", "")
 
-# Find the LAST line containing our prompt (the anchor)
+# Find the LAST line containing our prompt (the anchor). Use the first
+# LINE of the prompt (a multi-line prompt slice would contain a newline
+# and never match any captured line). If a long needle fails — narrow TUI
+# input boxes wrap the echoed prompt — retry with a shorter one.
 prompt_line = -1
-prompt_needle = prompt[:80].strip()
+first_line = prompt.strip().splitlines()[0].strip() if prompt.strip() else ""
 
-if prompt_needle:
+for cut in (80, 40):
+    prompt_needle = first_line[:cut].strip()
+    if not prompt_needle:
+        break
     for i, line in enumerate(lines):
         if prompt_needle in line:
             prompt_line = i
+    if prompt_line >= 0:
+        break
+    if len(first_line) <= cut:
+        break
 
 # Everything after our prompt is the response
 if prompt_line >= 0:
@@ -435,14 +456,19 @@ cmd_start() {
             fi
             rm -f "$lock"  # stale lock
         fi
+        # Claim the cmd+dir lock atomically (noclobber) BEFORE creating the
+        # session: if two starts race, exactly one wins; the loser sees the
+        # winner's session instead of both writing the lock last-wins.
+        if ! (set -C; printf '%s\n' "$TUI_SESSION" > "$lock") 2>/dev/null; then
+            err "Error: another session '$(cat "$lock" 2>/dev/null)' just claimed this command+directory."
+            err "Pass --session NAME to start an independent session."
+            return 1
+        fi
     fi
 
     log "Creating tmux session '$TUI_SESSION' ..."
     tmux new-session -s "$TUI_SESSION" -d -x "$TERM_WIDTH" -y "$TERM_HEIGHT"
     tmux send-keys -t "$TUI_SESSION" "cd $(printf '%q' "$WORK_DIR") && $TUI_CMD" Enter
-    if [ "$SESSION_EXPLICIT" = false ]; then
-        echo "$TUI_SESSION" > "$lock"
-    fi
 
     # Spawn a watchdog that kills the session if the caller dies.
     _start_watchdog
@@ -797,9 +823,11 @@ cmd_progress() {
 # Orphan discovery and cleanup (global — across all dirs and commands).
 #
 # Every session tui-driver starts gets a per-session watchdog file
-# (/tmp/.tui-driver-<session>.watchdog) holding the watchdog PID. That set of
+# (<STATE_DIR>/<session>.watchdog) holding the watchdog PID. That set of
 # files is the authoritative registry of tui-driver-managed sessions — more
 # reliable than matching tmux names, and it works for custom --session names.
+# Legacy /tmp/.tui-driver-* files from older versions are scanned too, so
+# pre-upgrade sessions stay discoverable and reapable.
 #
 # A session is an ORPHAN (safe to reap) only if BOTH hold:
 #   * its watchdog process is dead (no auto-cleanup will ever run again), AND
@@ -809,21 +837,31 @@ cmd_progress() {
 
 _watchdog_alive() {
     local pid="$1"
-    [ -n "$pid" ] && [ "$pid" != "none" ] && kill -0 "$pid" 2>/dev/null
+    [ -n "$pid" ] || return 1
+    [ "$pid" != "none" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    # PID-recycling guard: the watchdog is a fork of this script, so its
+    # command line still names tui-driver. A recycled PID would otherwise
+    # make list/reap treat a long-dead watchdog as alive forever.
+    # shellcheck disable=SC2009  # pgrep cannot inspect one specific PID's args
+    ps -o args= -p "$pid" 2>/dev/null | grep -q tui-driver
 }
 
 _iter_managed_sessions() {
     # Emit "session<TAB>watchdog_pid<TAB>idle_seconds<TAB>alive(0/1)" per line.
-    # idle_seconds is -1 when no stamp exists.
+    # idle_seconds is -1 when no stamp exists. Scans the current state dir
+    # and the legacy /tmp layout; the sibling stamp is derived from the
+    # watchdog file's own path so both layouts resolve correctly.
     local wd session pid stamp last now idle alive
     now=$(date +%s)
     shopt -s nullglob
-    for wd in /tmp/.tui-driver-*.watchdog; do
-        session=${wd#/tmp/.tui-driver-}
+    for wd in "$STATE_DIR"/*.watchdog /tmp/.tui-driver-*.watchdog; do
+        session=${wd##*/}
+        session=${session#.tui-driver-}
         session=${session%.watchdog}
         pid=$(cat "$wd" 2>/dev/null || echo "none")
         [ -n "$pid" ] || pid="none"
-        stamp="/tmp/.tui-driver-${session}.stamp"
+        stamp="${wd%.watchdog}.stamp"
         if [ -f "$stamp" ]; then
             last=$(cat "$stamp" 2>/dev/null || echo "$now")
             idle=$((now - last))
@@ -833,21 +871,34 @@ _iter_managed_sessions() {
         if tmux has-session -t "$session" 2>/dev/null; then alive=1; else alive=0; fi
         printf '%s\t%s\t%s\t%s\n' "$session" "$pid" "$idle" "$alive"
     done
+    # Stamps without a watchdog file: a watchdog that cleaned up can race a
+    # blocking call whose heartbeat re-creates the stamp just after. Emit
+    # them (pid "none") so list shows the leak and reap can clear it.
+    local st
+    for st in "$STATE_DIR"/*.stamp /tmp/.tui-driver-*.stamp; do
+        [ -f "${st%.stamp}.watchdog" ] && continue
+        session=${st##*/}
+        session=${session#.tui-driver-}
+        session=${session%.stamp}
+        last=$(cat "$st" 2>/dev/null || echo "$now")
+        idle=$((now - last))
+        if tmux has-session -t "$session" 2>/dev/null; then alive=1; else alive=0; fi
+        printf '%s\t%s\t%s\t%s\n' "$session" "none" "$idle" "$alive"
+    done
     shopt -u nullglob
 }
 
 _clear_session_state() {
-    local session="$1"
-    rm -f "/tmp/.tui-driver-${session}.stamp" \
-          "/tmp/.tui-driver-${session}.watchdog" \
-          "/tmp/.tui-driver-${session}.async" \
-          "/tmp/.tui-driver-${session}.poll-hash" \
-          "/tmp/.tui-driver-${session}.last-send" \
-          "/tmp/.tui-driver-${session}.prompt"
+    # Remove every state file for the session, current and legacy layout.
+    local session="$1" ext
+    for ext in stamp watchdog async poll-hash last-send prompt; do
+        rm -f "${STATE_DIR}/${session}.${ext}" \
+              "/tmp/.tui-driver-${session}.${ext}"
+    done
     # Drop any cmd+dir lock that still points at this (dead) session.
     local lf
     shopt -s nullglob
-    for lf in /tmp/.tui-driver-*.lock; do
+    for lf in "$STATE_DIR"/*.lock /tmp/.tui-driver-*.lock; do
         if [ "$(cat "$lf" 2>/dev/null)" = "$session" ]; then
             rm -f "$lf"
         fi
@@ -941,14 +992,16 @@ cmd_install() {
     src="${srcdir}/$(basename "$0")"
     dst="${INSTALL_DIR}/${INSTALL_NAME}"
     mkdir -p "$INSTALL_DIR"
-    cp "$src" "$dst"
-    chmod +x "$dst"
     # Bake the source tree's git stamp into the installed copy so `version`
-    # reports the exact commit it was built from (the install dir is not a repo).
+    # reports the exact commit it was built from (the install dir is not a
+    # repo). Substitute during the copy — BSD/macOS sed has no GNU -i.
     stamp=$(_git_stamp "$srcdir" 2>/dev/null) || stamp=""
     if [ -n "$stamp" ]; then
-        sed -i "s/^BUILD_STAMP=\"\"/BUILD_STAMP=\"${stamp}\"/" "$dst"
+        sed "s/^BUILD_STAMP=\"\"/BUILD_STAMP=\"${stamp}\"/" "$src" > "$dst"
+    else
+        cp "$src" "$dst"
     fi
+    chmod +x "$dst"
     log "Installed to $dst${stamp:+ (${stamp})}"
     if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
         log "WARNING: ${INSTALL_DIR} is not in your PATH."
