@@ -115,31 +115,51 @@ be notified when the result arrives.
   one is pending fails with `already pending` until you retrieve the result.
   Retrieving the result is what releases the lock.
 - A single `poll` is **self-contained**: one call returns the *whole* response
-  when the screen is stable (exit 0), or `waiting` (exit 1) if still working.
+  when the screen is stable (exit 0), or `waiting` (exit 2) if still working.
   You never need to call `poll` twice in a row.
-- **Never use `raw` to "monitor" a pending task** — `raw` doesn't consume the
-  result or release the lock, so the task stays pending and your next send
-  fails. Use `poll`/`poll --wait` to retrieve; use `raw` only for debugging.
+- A **timeout (exit 3) does not lose the task** — it stays pending. Poll again
+  (or with a larger `TUI_TIMEOUT`) for the rest, or drop it with
+  `tui-driver claude cancel`.
+- **To check on a running task without retrieving it**, use
+  `tui-driver claude progress` (read-only: pending?, elapsed, screen
+  changing?, last screen lines). Never use `raw` for monitoring; it's for
+  debugging a session that already misbehaves.
+- Exit codes: `0` ready, `1` hard error (reason on stderr even with `-q`),
+  `2` still working, `3` timeout.
 
 **Long tasks need a bigger timeout.** The default `TUI_TIMEOUT` is 300s. A
 substantial coding/exploration task can exceed that — set `TUI_TIMEOUT` (e.g.
 `900` or more) on the `poll --wait` call. If output gets clipped or never
 settles, raise `TUI_STABLE` (more consecutive stable samples) too.
 
+**Exact completion marker (recommended for delegates).** Since you control
+the delegate's prompt, ask it to end with a marker and pass `--until` — the
+result returns the moment it's done, with no risk of a mid-task pause being
+mistaken for completion:
+
+```bash
+tui-driver claude send-async "…do the task… When completely finished, print the word DONE followed by three exclamation marks on its own line."
+TUI_TIMEOUT=900 tui-driver -q --until 'DONE!!!' claude poll --wait
+```
+
+(Describe the marker in the prompt rather than spelling it out, so the echo
+of your own prompt can't match the pattern.)
+
 ## Handling the Sub-Claude's Permission Prompts
 
 A driven `claude` will pause on tool-permission dialogs (edit a file, run a
 command, etc.). Your `poll` will return with the dialog text on screen instead
-of a final answer. Read it, decide, and reply:
+of a final answer. Read it, decide, and reply with `respond --async`, which
+re-arms the pending task so the next `poll --wait` picks up where it left off:
 
 ```bash
-tui-driver claude respond "y"     # approve the pending tool use
-tui-driver claude respond "n"     # deny
-tui-driver claude respond ""      # press Enter (accept the highlighted default)
+tui-driver claude respond --async "y"     # approve the pending tool use
+tui-driver claude respond --async "n"     # deny
+tui-driver claude respond --async ""      # press Enter (accept the highlighted default)
 ```
 
-After responding, start a new `poll --wait` to get the next state or the final
-result.
+After responding, start a new `poll --wait` (in the background) to get the
+next state or the final result.
 
 **Safety:** you are approving tool use in a *separate* agent. Don't blindly
 `respond "y"` to everything — inspect the dialog first. If you want the sub-task
@@ -182,9 +202,12 @@ self-contained.
    don't spawn frivolously or in loops.
 2. **Only for isolation / parallelism / second opinion** — not routine work.
 3. **Always `send-async` + `poll --wait` (background)** — never block.
-4. **One pending task per session**; retrieve before sending again.
-5. **Never monitor a pending task with `raw`** — use `poll`/`poll --wait`.
-6. **Raise `TUI_TIMEOUT`** for substantial tasks (default 300s is often short).
+4. **One pending task per session**; retrieve before sending again. A
+   timeout keeps the task pending — poll again or `cancel`.
+5. **Monitor with `progress`, retrieve with `poll`/`poll --wait`** — never
+   monitor with `raw`.
+6. **Raise `TUI_TIMEOUT`** for substantial tasks (default 300s is often
+   short) and prefer an `--until` completion marker.
 7. **Self-contained prompts** — the sub-Claude has none of your context.
 8. **Prefer file output** (`write … to /tmp/…`) and read it back to verify.
 9. **Inspect permission dialogs** before `respond`-ing; don't auto-approve.

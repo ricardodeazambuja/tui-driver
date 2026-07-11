@@ -81,10 +81,20 @@ tui-driver -q agy poll --wait
 `poll --wait` in a second Bash call with `run_in_background: true`. Continue
 with other work — you'll be notified when the response arrives.
 
-**If you need to check without blocking** (e.g. to peek at progress):
+**To check on a pending query without retrieving it**, use `progress` —
+read-only, safe to run any number of times:
 ```bash
-tui-driver agy poll    # prints "waiting" if not ready, or the full response
+tui-driver agy progress   # pending?, sent_ago, screen changing?, last lines
 ```
+
+**If you need to retrieve without blocking:**
+```bash
+tui-driver agy poll    # prints "waiting" (exit 2) if not ready, or the full response (exit 0)
+```
+
+**Exit codes (same for send/poll/respond):** `0` = response ready, `1` =
+hard error (no session, no pending query — the reason is printed to stderr
+even with `-q`), `2` = still working (`poll`), `3` = timeout.
 
 **How `poll` behaves (so you don't get stuck):**
 - Only **one** `send-async` can be pending per session at a time. If you try
@@ -92,12 +102,14 @@ tui-driver agy poll    # prints "waiting" if not ready, or the full response
   must retrieve the first response (with `poll` or `poll --wait`) before
   sending again. Retrieving the response is what releases the lock.
 - A single `poll` is **self-contained**: one call returns the *whole*
-  response when the screen is stable (exit 0), or `waiting` (exit 1) if it's
+  response when the screen is stable (exit 0), or `waiting` (exit 2) if it's
   still generating. You never need to call `poll` twice in a row.
-- **Never use `raw` to "monitor" a pending query.** `raw` does not consume the
-  response or release the lock, so the query stays pending and your next send
-  fails. Use `poll`/`poll --wait` to retrieve; use `raw` only for debugging a
-  session that already misbehaves.
+- A **timeout (exit 3) does not lose the query** — it stays pending. Poll
+  again (or with a larger `TUI_TIMEOUT`) for the rest, or drop it with
+  `tui-driver agy cancel` if you no longer want it.
+- **Never use `raw` to "monitor" a pending query** — use `progress` for that.
+  Use `poll`/`poll --wait` to retrieve; `raw` only for debugging a session
+  that already misbehaves.
 - If a query seems to return clipped or empty output, raise `TUI_STABLE`
   (more consecutive stable samples) or `TUI_POLL` (longer gap between samples)
   on that invocation, e.g. `TUI_STABLE=3 tui-driver -q agy poll --wait`.
@@ -153,15 +165,19 @@ tui-driver agy send-async "Read https://example.com/connector-spec.pdf and extra
 ## Handling Approvals
 
 If Antigravity needs approval for a tool (e.g., to fetch a URL), `send-async` will
-return the approval dialog on the next `poll`. Read it, decide, and reply:
+return the approval dialog on the next `poll`. Read it, decide, and reply
+with `respond --async`, which re-arms the pending query so the next
+`poll` / `poll --wait` retrieves the real response:
 
 ```bash
-tui-driver agy respond "y"     # approve
-tui-driver agy respond "n"     # deny
-tui-driver agy respond ""      # press Enter (accept default)
+tui-driver agy respond --async "y"     # approve
+tui-driver agy respond --async "n"     # deny
+tui-driver agy respond --async ""      # press Enter (accept default)
 ```
 
-After responding, start a new `poll --wait` to get the actual response.
+After responding, run `poll --wait` (in the background) to get the actual
+response. (Plain `respond` without `--async` blocks and prints the resulting
+screen itself — fine for quick dialogs in synchronous flows.)
 
 ## Accuracy Warning — Antigravity Uses a Simpler Model
 
@@ -200,5 +216,5 @@ potentially garbled summary.
 7. **Report results** — summarize Antigravity's output for the user, including source URLs.
 8. **The output includes TUI chrome** (borders, status bars) — just ignore those lines and extract the actual response content.
 9. **For documents** — always specify what to extract; don't ask Antigravity to dump entire documents.
-10. **Be patient** — Antigravity searches take time (1-3 minutes for complex queries with multiple Google searches). After launching `poll --wait` in the background, **do NOT check raw screen output** to monitor progress — it wastes tokens and doesn't speed anything up. Trust the background notification and do other work while waiting.
+10. **Be patient** — Antigravity searches take time (1-3 minutes for complex queries with multiple Google searches). After launching `poll --wait` in the background, trust the background notification and do other work while waiting. If you genuinely need to check on it (e.g. suspecting a stall), use `tui-driver agy progress` — never `raw`.
 11. **Verify critical data** — when accuracy matters, ask Antigravity to save raw output to a file (e.g. `/tmp/result.md`) so you can read and verify it yourself. Don't rely solely on Antigravity's summaries for design decisions.

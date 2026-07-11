@@ -111,6 +111,18 @@ Pass an empty string to just press Enter:
 tui-driver aichat respond ""
 ```
 
+`respond` blocks and prints the resulting screen itself. When the dialog
+interrupted an **async** query, use `respond --async` instead: it replies,
+returns immediately, and re-arms the pending query so a follow-up
+`poll` / `poll --wait` retrieves the real response:
+
+```bash
+tui-driver agy send-async "Fetch https://example.com and summarise"
+tui-driver agy poll            # → returns the approval dialog text
+tui-driver agy respond --async "y"
+tui-driver agy poll --wait     # → the actual response
+```
+
 ### Working directory
 
 Tell the TUI which directory to start in:
@@ -217,7 +229,7 @@ tui-driver agy send-async "Analyse all files in this repo"
 
 # Do other work ...
 
-# Check back (non-blocking): exits 0 if ready, 1 if still working
+# Check back (non-blocking): exits 0 if ready, 2 if still working
 if tui-driver agy poll; then
     echo "Response is ready (printed to stdout above)"
 else
@@ -230,6 +242,28 @@ tui-driver agy poll --wait
 
 Only one async query can be pending per session. Call `poll` to retrieve
 the response before sending another `send-async`.
+
+To check on a pending query **without** retrieving it, use `progress` —
+it is read-only and safe to run any number of times:
+
+```bash
+$ tui-driver agy progress
+session=running
+pending=yes
+sent_ago=42s
+prompt=Analyse all files in this repo
+screen=changing
+last_lines:
+... last three non-empty screen lines ...
+```
+
+If a blocking call times out (exit 3), the query is **not** lost: it stays
+pending, and the scrollback is preserved. Poll again for the rest, raise
+`TUI_TIMEOUT`, or drop it explicitly:
+
+```bash
+tui-driver agy cancel   # clears the pending record; session keeps running
+```
 
 ### Tuning timing parameters
 
@@ -245,6 +279,23 @@ TUI_TIMEOUT=600 tui-driver claude send "Write a long essay"
 # Cautious rate limiting: 10s minimum gap + up to 5s jitter
 TUI_MIN_INTERVAL=10 TUI_JITTER=5 tui-driver agy send "Query 1"
 ```
+
+**Exact completion with a marker (`--until`).** Screen stability is a
+heuristic: it adds a `TUI_POLL × TUI_STABLE` latency tail, and a TUI whose
+screen never settles (spinners, clocks) or that pauses mid-response can
+fool it. When you control the prompt — always true with AI TUIs — you can
+opt into exact completion instead: instruct the TUI to end with a marker
+and pass `--until REGEX` (or `TUI_DONE_PATTERN`). The response is returned
+the moment the marker appears in it, no stability tail:
+
+```bash
+tui-driver --until 'DONE!!!' agy send \
+  "Summarise the README. End your reply with the word DONE and three exclamation marks."
+```
+
+Word the instruction so the literal marker is **not** in your prompt
+(describe it, as above) — otherwise the echo of your own prompt can match
+the pattern prematurely.
 
 **`TUI_TIMEOUT` vs `TUI_WATCHDOG`.** These bound two different things and do
 not interfere:
@@ -302,12 +353,15 @@ described above and include session-recovery steps. See each
 
 | Action | Description | Blocking | Exit code |
 |--------|-------------|----------|-----------|
-| `start` | Launch TUI in tmux, wait for it to be ready | Yes | 0 = ready, 1 = timeout |
-| `send "prompt"` | Send prompt, wait for response | Yes | 0 = stable, 1 = timeout |
+| `start` | Launch TUI in tmux, wait for it to be ready | Yes | 0 = ready, 3 = timeout |
+| `send "prompt"` | Send prompt, wait for a non-empty response | Yes | 0 = ready, 3 = timeout (query stays pending) |
 | `send-async "prompt"` | Send prompt, return immediately | No | 0 = sent, 1 = error |
-| `poll` | Self-contained stability probe (~`TUI_STABLE`×`TUI_POLL`s): returns the full response if ready, else `waiting` | Brief | 0 = ready, 1 = still changing |
-| `poll --wait` | Block until async response is ready | Yes | 0 = stable, 1 = timeout |
-| `respond "reply"` | Send a short reply (e.g. `y`, `n`, `""`) | Yes | 0 = stable, 1 = timeout |
+| `poll` | Self-contained stability probe (~`TUI_STABLE`×`TUI_POLL`s): returns the full response if ready, else `waiting` | Brief | 0 = ready, 2 = still changing |
+| `poll --wait` | Block until async response is ready | Yes | 0 = ready, 3 = timeout (query stays pending) |
+| `progress` | Read-only check on a pending query: pending?, elapsed, screen changing?, last lines. Never consumes anything | ~1s | 0, 1 = no session |
+| `respond "reply"` | Send a short reply (e.g. `y`, `n`, `""`), print resulting screen | Yes | 0 = stable, 3 = timeout |
+| `respond --async "reply"` | Reply and re-arm the pending query for `poll` | No | 0 = sent, 1 = error |
+| `cancel` | Drop a pending async query (session keeps running) | No | 0 |
 | `stop` | Kill session and clean up | No | 0 |
 | `status` | Print `running` or `stopped` | No | 0 |
 | `raw` | Dump raw screen content | No | 0 |
@@ -315,6 +369,11 @@ described above and include session-recovery steps. See each
 | `reap` | Kill orphaned sessions and clear leaked state (see below) | No | 0 |
 | `install` | Copy to `~/.local/bin` | No | 0 |
 | `uninstall` | Remove from `~/.local/bin` | No | 0 |
+
+Exit code 1 always means a hard error (no session, no pending async, bad
+usage) and is explained on stderr — even under `--quiet`. Code 2 means
+"not ready yet, ask again"; code 3 means "timed out" (for `send`/`poll
+--wait` the query stays pending and can still be retrieved).
 
 `list` and `reap` are global — they operate across every working directory
 and TUI command, so you can inspect or clean up sessions you started from
@@ -326,7 +385,8 @@ elsewhere (or that were orphaned when a caller died).
 |------|-------------|
 | `--session NAME` | Run an independent named session. Bypasses the per-directory lock, so multiple agents can drive the same command from the same directory in parallel (see below). Pass the same NAME to every `send`/`respond`/`poll`/`stop`. |
 | `--dir DIR` | Set the working directory for the TUI process |
-| `--quiet`, `-q` | Suppress stderr logs |
+| `--until REGEX` | Treat the response as complete the moment REGEX appears in it (see "Exact completion with a marker") |
+| `--quiet`, `-q` | Suppress stderr progress logs (errors are always shown) |
 
 ### Environment variables
 
@@ -341,7 +401,11 @@ elsewhere (or that were orphaned when a caller died).
 | `TUI_WIDTH` | `200` | Terminal width in columns |
 | `TUI_HEIGHT` | `50` | Terminal height in rows |
 | `TUI_WATCHDOG` | `600` | Seconds of inactivity before auto-cleanup |
-| `TUI_QUIET` | `false` | Suppress logs (same as `--quiet`) |
+| `TUI_QUIET` | `false` | Suppress progress logs (same as `--quiet`) |
+| `TUI_PASTE_DELAY` | `0.5` | Pause between pasting the prompt and pressing Enter |
+| `TUI_START_TIMEOUT` | `60` | Max seconds to wait for the TUI at startup |
+| `TUI_HEARTBEAT` | `15` | "still waiting" log line every N seconds while blocked (0 = off) |
+| `TUI_DONE_PATTERN` | unset | Completion regex, same as `--until` |
 
 ## Design decisions
 
@@ -380,6 +444,13 @@ The cost is latency: you always wait at least `TUI_POLL * TUI_STABLE`
 seconds after the last change. The default (2s poll, 2 stable = 4s
 extra) is a good tradeoff for most interactive AI tools.
 
+Two guards keep the heuristic honest. A stable screen with an **empty**
+extracted response is not accepted — a TUI that has not started printing
+yet (backend call, thinking pause) also has a stable screen, and returning
+early there is how partial/empty answers happen. And when even that is not
+enough — screens that never settle, long mid-response pauses — `--until`
+(above) replaces the heuristic with an exact completion marker.
+
 ### Robustness over clean output
 
 The screen capture includes whatever the TUI drew: ANSI formatting
@@ -402,7 +473,10 @@ multiple callers share the same TUI command, and makes it harder for
 unrelated processes to stumble onto the wrong session.
 
 The mapping from (command + working directory) to session name is stored
-in a lock file under `/tmp`. This means:
+in a lock file under `${XDG_RUNTIME_DIR:-~/.cache}/tui-driver/` — a
+user-private (0700) directory, which keeps other local users away from the
+session state and keeps `/tmp` cleaners from deleting a live session's
+liveness stamp. This means:
 
 - The **same caller** (same command, same directory) reconnects to its
   existing session automatically.
@@ -410,8 +484,9 @@ in a lock file under `/tmp`. This means:
   different lock file and gets its own session.
 
 Note: `$RANDOM` is not a cryptographic RNG — treat this as collision
-avoidance, not a security boundary. If two principals share a
-filesystem, they can read each other's `/tmp` lock files.
+avoidance, not a security boundary. Sessions started by a pre-0.3 version
+kept their state under `/tmp`; `list` and `reap` still scan that legacy
+layout, but drive such sessions with the old binary or reap them.
 
 ### Watchdog for orphaned sessions
 
@@ -419,11 +494,11 @@ If the calling process dies without running `stop`, the tmux session
 would linger forever. tui-driver spawns a background watchdog that
 monitors a timestamp file:
 
-- Every `send`, `respond`, or `poll` updates the timestamp — and while a
-  blocking call is *waiting* for a response, its poll loop keeps refreshing
-  the timestamp too, so a long-running response is never mistaken for a dead
-  caller (`TUI_TIMEOUT` bounds a single response; `TUI_WATCHDOG` bounds caller
-  absence).
+- Every `send`, `respond`, `poll`, or `progress` updates the timestamp — and
+  while a blocking call is *waiting* for a response, its poll loop keeps
+  refreshing the timestamp too, so a long-running response is never mistaken
+  for a dead caller (`TUI_TIMEOUT` bounds a single response; `TUI_WATCHDOG`
+  bounds caller absence).
 - The watchdog checks every 30 seconds.
 - If no activity for `TUI_WATCHDOG` seconds (default: 10 minutes), it
   kills the session and removes all temp files.
@@ -466,9 +541,12 @@ workflows:
   retrieving the response is what clears the pending lock.
 - `poll --wait` blocks until the response is ready, intended to run in
   the background so the agent gets notified on completion.
+- `progress` answers "is it still working?" without touching the pending
+  query — elapsed time, screen activity, last screen lines.
 
 Only one async query is allowed per session at a time to prevent
-ambiguous state.
+ambiguous state. A timeout never discards the query: it stays pending
+until retrieved by a poll or dropped with `cancel`.
 
 ## Example: orchestrating two AI tools from a script
 
@@ -508,8 +586,10 @@ set -euo pipefail
 tui-driver -q agy start
 tui-driver -q agy send-async "Write a detailed analysis of merge sort"
 
-# Poll every 5 seconds, do other work in between
-while ! tui-driver -q agy poll 2>/dev/null; do
+# Poll every 5 seconds, do other work in between.
+# Exit 2 = still working; anything else (0 = ready, 1 = session died,
+# 3 = timeout) ends the loop instead of spinning forever.
+while tui-driver -q agy poll; rc=$?; [ "$rc" -eq 2 ]; do
     echo "Still waiting... doing other work"
     sleep 5
 done

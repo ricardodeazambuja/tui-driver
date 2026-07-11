@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 # Baked in at install time by cmd_install (git short hash, +-dirty if the
 # source tree had uncommitted changes). Empty when running straight from a
 # checkout, in which case _build_stamp falls back to live git.
