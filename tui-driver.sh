@@ -129,6 +129,12 @@ log() {
     printf '[tui-driver:%s] %s\n' "${TUI_SESSION:-tui-driver}" "$*" >&2
 }
 
+# Errors and timeout notices must reach the caller even under --quiet:
+# an agent that gets a bare exit code with no explanation cannot recover.
+err() {
+    printf '[tui-driver:%s] %s\n' "${TUI_SESSION:-tui-driver}" "$*" >&2
+}
+
 _stamp_file()    { echo "/tmp/.tui-driver-${TUI_SESSION}.stamp"; }
 _watchdog_file() { echo "/tmp/.tui-driver-${TUI_SESSION}.watchdog"; }
 _async_file()    { echo "/tmp/.tui-driver-${TUI_SESSION}.async"; }
@@ -342,8 +348,8 @@ if lines:
 cmd_start() {
     # Prevent starting if a session already exists for this TUI
     if tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
-        log "Error: session '$TUI_SESSION' is already running."
-        log "Run 'tui-driver $TUI_CMD stop' first, then start again."
+        err "Error: session '$TUI_SESSION' is already running."
+        err "Run 'tui-driver $TUI_CMD stop' first, then start again."
         return 1
     fi
 
@@ -358,8 +364,8 @@ cmd_start() {
             local existing
             existing=$(cat "$lock")
             if tmux has-session -t "$existing" 2>/dev/null; then
-                log "Error: another session '$existing' is already running for this command+directory."
-                log "Run 'tui-driver $TUI_CMD stop' first, or pass --session NAME to start a second, independent session."
+                err "Error: another session '$existing' is already running for this command+directory."
+                err "Run 'tui-driver $TUI_CMD stop' first, or pass --session NAME to start a second, independent session."
                 return 1
             fi
             rm -f "$lock"  # stale lock
@@ -378,8 +384,8 @@ cmd_start() {
 
     log "Waiting for $TUI_CMD to start ..."
     if ! _wait_stable 60; then
-        log "Warning: startup timed out after 60s"
-        return 1
+        err "Warning: startup timed out after 60s"
+        return 3
     fi
 
     log "$TUI_CMD is ready"
@@ -390,12 +396,12 @@ cmd_send() {
     local prompt="${1:?Usage: tui-driver $TUI_CMD send \"your prompt\"}"
 
     if ! tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
-        log "Error: no session running. Run 'tui-driver $TUI_CMD start' first."
+        err "Error: no session running. Run 'tui-driver $TUI_CMD start' first."
         return 1
     fi
 
     if [ -f "$(_async_file)" ]; then
-        log "Error: async query pending. Poll first: tui-driver $TUI_CMD poll --wait"
+        err "Error: async query pending. Poll first: tui-driver $TUI_CMD poll --wait"
         return 1
     fi
 
@@ -417,11 +423,11 @@ cmd_send() {
         return 0
     fi
 
-    log "Timeout after ${MAX_WAIT}s - returning what is on screen"
+    err "Timeout after ${MAX_WAIT}s - returning what is on screen"
     _extract_response "$prompt"
     tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
     _stamp
-    return 1
+    return 3
 }
 
 cmd_respond() {
@@ -429,12 +435,12 @@ cmd_respond() {
     local reply="${1:-}"
 
     if ! tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
-        log "Error: no session running."
+        err "Error: no session running."
         return 1
     fi
 
     if [ -f "$(_async_file)" ]; then
-        log "Error: async query pending. Poll first: tui-driver $TUI_CMD poll --wait"
+        err "Error: async query pending. Poll first: tui-driver $TUI_CMD poll --wait"
         return 1
     fi
 
@@ -458,11 +464,11 @@ cmd_respond() {
         return 0
     fi
 
-    log "Timeout after ${MAX_WAIT}s"
+    err "Timeout after ${MAX_WAIT}s"
     _capture
     tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
     _stamp
-    return 1
+    return 3
 }
 
 # ---------------------------------------------------------------------------
@@ -487,7 +493,7 @@ cmd_send_async() {
     local prompt="${1:?Usage: tui-driver $TUI_CMD send-async \"your prompt\"}"
 
     if ! tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
-        log "Error: no session running. Run 'tui-driver $TUI_CMD start' first."
+        err "Error: no session running. Run 'tui-driver $TUI_CMD start' first."
         return 1
     fi
 
@@ -496,7 +502,7 @@ cmd_send_async() {
     local async_file
     async_file=$(_async_file)
     if [ -f "$async_file" ]; then
-        log "Error: a send-async is already pending. Run 'poll' or 'poll --wait' first."
+        err "Error: a send-async is already pending. Run 'poll' or 'poll --wait' first."
         return 1
     fi
 
@@ -523,7 +529,7 @@ cmd_poll() {
     fi
 
     if ! tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
-        log "Error: no session running."
+        err "Error: no session running."
         return 1
     fi
 
@@ -532,7 +538,7 @@ cmd_poll() {
     poll_hash_file=$(_poll_hash_file)
 
     if [ ! -f "$async_file" ]; then
-        log "Error: no pending send-async. Use 'send-async' first."
+        err "Error: no pending send-async. Use 'send-async' first."
         return 1
     fi
 
@@ -553,12 +559,12 @@ cmd_poll() {
             return 0
         fi
 
-        log "Timeout after ${MAX_WAIT}s - returning what is on screen"
+        err "Timeout after ${MAX_WAIT}s - returning what is on screen"
         _extract_response "$prompt"
         tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
         rm -f "$async_file" "$poll_hash_file"
         _stamp
-        return 1
+        return 3
     fi
 
     # Non-blocking mode: a SELF-CONTAINED stability probe. Sample the screen
@@ -604,7 +610,7 @@ cmd_poll() {
     # continuously via _wait_stable.
     log "Still waiting ..."
     echo "waiting"
-    return 1
+    return 2
 }
 
 cmd_stop() {
@@ -851,6 +857,12 @@ Flags:
   --quiet, -q       Suppress stderr logs (saves tokens for agents)
   --version, -v     Print the tui-driver version
 
+Exit codes:
+  0   success / response ready
+  1   hard error (no session, no pending async, bad usage)
+  2   poll: response not ready yet (prints "waiting")
+  3   timeout (start/send/respond/poll --wait) — output may be incomplete
+
 Environment (override any default):
   TUI_POLL          poll interval        (default: 2s)
   TUI_TIMEOUT       max wait             (default: 300s)
@@ -886,7 +898,7 @@ How poll works (read this before driving from an agent):
     while one is pending fails with "already pending" until you retrieve
     the first response with poll/poll --wait.
   * poll is self-contained: a single call samples the screen until it is
-    stable, then prints the WHOLE response (exit 0) — or "waiting" (exit 1)
+    stable, then prints the WHOLE response (exit 0) — or "waiting" (exit 2)
     if still changing. You do NOT need to call it twice. Retrieving a
     response is what clears the pending lock.
   * For long-running queries, run `poll --wait` in the BACKGROUND and keep
