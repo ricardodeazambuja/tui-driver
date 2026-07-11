@@ -46,6 +46,8 @@ TERM_WIDTH="${TUI_WIDTH:-200}"
 TERM_HEIGHT="${TUI_HEIGHT:-50}"
 MIN_INTERVAL="${TUI_MIN_INTERVAL:-3}"   # minimum seconds between sends
 JITTER="${TUI_JITTER:-2}"               # random 0..JITTER seconds added
+PASTE_DELAY="${TUI_PASTE_DELAY:-0.5}"   # pause between paste and Enter
+START_TIMEOUT="${TUI_START_TIMEOUT:-60}" # max wait for the TUI to come up
 QUIET="${TUI_QUIET:-false}"             # suppress stderr logs (for agents)
 SESSION_EXPLICIT=false                   # true once --session NAME is given
 
@@ -139,6 +141,7 @@ _stamp_file()    { echo "/tmp/.tui-driver-${TUI_SESSION}.stamp"; }
 _watchdog_file() { echo "/tmp/.tui-driver-${TUI_SESSION}.watchdog"; }
 _async_file()    { echo "/tmp/.tui-driver-${TUI_SESSION}.async"; }
 _poll_hash_file(){ echo "/tmp/.tui-driver-${TUI_SESSION}.poll-hash"; }
+_last_send_file(){ echo "/tmp/.tui-driver-${TUI_SESSION}.last-send"; }
 _lock_file() {
     # Lock is keyed on command+directory, NOT session name.
     # This lets _default_session find the right session.
@@ -170,11 +173,12 @@ _start_watchdog() {
     # the stamp file: every send/respond updates it.  If no activity for
     # WATCHDOG_TIMEOUT seconds, assume the caller is gone and clean up.
     local session="$TUI_SESSION"
-    local stamp watchdog async poll_hash
+    local stamp watchdog async poll_hash last_send
     stamp=$(_stamp_file)
     watchdog=$(_watchdog_file)
     async=$(_async_file)
     poll_hash=$(_poll_hash_file)
+    last_send=$(_last_send_file)
     local timeout="${TUI_WATCHDOG:-600}"  # 10 minutes default
 
     # Seed the stamp so the watchdog has a starting point
@@ -186,7 +190,7 @@ _start_watchdog() {
             # If the session is gone (stopped, crashed, killed elsewhere),
             # clean up our own per-session state so it does not leak into /tmp.
             if ! tmux has-session -t "$session" 2>/dev/null; then
-                rm -f "$stamp" "$async" "$poll_hash" "$watchdog"
+                rm -f "$stamp" "$async" "$poll_hash" "$watchdog" "$last_send"
                 _rm_owned_lock "$session"
                 break
             fi
@@ -198,14 +202,14 @@ _start_watchdog() {
                 idle=$((now - last))
                 if [ "$idle" -gt "$timeout" ]; then
                     tmux kill-session -t "$session" 2>/dev/null || true
-                    rm -f "$stamp" "$async" "$poll_hash" "$watchdog"
+                    rm -f "$stamp" "$async" "$poll_hash" "$watchdog" "$last_send"
                     _rm_owned_lock "$session"
                     break
                 fi
             else
                 # No stamp file — caller probably died without stopping
                 tmux kill-session -t "$session" 2>/dev/null || true
-                rm -f "$async" "$poll_hash" "$watchdog"
+                rm -f "$async" "$poll_hash" "$watchdog" "$last_send"
                 _rm_owned_lock "$session"
                 break
             fi
@@ -226,11 +230,15 @@ _stop_watchdog() {
 }
 
 _throttle() {
-    local stamp_file
-    stamp_file=$(_stamp_file)
-    if [ -f "$stamp_file" ]; then
+    # Rate-limits SENDS only, keyed on the .last-send file. The watchdog
+    # liveness stamp (.stamp) is deliberately not used here: start and every
+    # wait-loop poll refresh it, which used to make the very first send after
+    # start eat the full MIN_INTERVAL+jitter penalty for no reason.
+    local send_file
+    send_file=$(_last_send_file)
+    if [ -f "$send_file" ]; then
         local last now elapsed wait_time jitter
-        last=$(cat "$stamp_file")
+        last=$(cat "$send_file")
         now=$(date +%s)
         elapsed=$((now - last))
         jitter=$(( RANDOM % (JITTER + 1) ))
@@ -244,6 +252,10 @@ _throttle() {
 
 _stamp() {
     date +%s > "$(_stamp_file)"
+}
+
+_mark_send() {
+    date +%s > "$(_last_send_file)"
 }
 
 _capture() {
@@ -383,8 +395,9 @@ cmd_start() {
     _start_watchdog
 
     log "Waiting for $TUI_CMD to start ..."
-    if ! _wait_stable 60; then
-        err "Warning: startup timed out after 60s"
+    if ! _wait_stable "$START_TIMEOUT"; then
+        err "Warning: startup timed out after ${START_TIMEOUT}s"
+        err "Session left running: inspect with 'raw', or 'stop' then 'start'."
         return 3
     fi
 
@@ -410,8 +423,9 @@ cmd_send() {
     # Send via bracketed paste (safe with !, ?, @, etc.)
     printf '%s' "$prompt" | tmux load-buffer -
     tmux paste-buffer -t "$TUI_SESSION" -p
-    sleep 0.5
+    sleep "$PASTE_DELAY"
     tmux send-keys -t "$TUI_SESSION" Enter
+    _mark_send
 
     log "Prompt sent, waiting for screen to stabilise ..."
 
@@ -511,8 +525,9 @@ cmd_send_async() {
     # Send via bracketed paste (safe with !, ?, @, etc.)
     printf '%s' "$prompt" | tmux load-buffer -
     tmux paste-buffer -t "$TUI_SESSION" -p
-    sleep 0.5
+    sleep "$PASTE_DELAY"
     tmux send-keys -t "$TUI_SESSION" Enter
+    _mark_send
 
     # Save prompt anchor and reset poll state for this session
     echo "$prompt" > "$async_file"
@@ -621,7 +636,7 @@ cmd_stop() {
     else
         log "No session to stop"
     fi
-    rm -f "$(_stamp_file)" "$(_async_file)" "$(_poll_hash_file)"
+    rm -f "$(_stamp_file)" "$(_async_file)" "$(_poll_hash_file)" "$(_last_send_file)"
     _rm_owned_lock "$TUI_SESSION"
 }
 
@@ -685,7 +700,8 @@ _clear_session_state() {
     rm -f "/tmp/.tui-driver-${session}.stamp" \
           "/tmp/.tui-driver-${session}.watchdog" \
           "/tmp/.tui-driver-${session}.async" \
-          "/tmp/.tui-driver-${session}.poll-hash"
+          "/tmp/.tui-driver-${session}.poll-hash" \
+          "/tmp/.tui-driver-${session}.last-send"
     # Drop any cmd+dir lock that still points at this (dead) session.
     local lf
     shopt -s nullglob
@@ -869,6 +885,8 @@ Environment (override any default):
   TUI_STABLE        stable polls needed  (default: 2)
   TUI_MIN_INTERVAL  min gap between sends (default: 3s)
   TUI_JITTER        random 0..N jitter   (default: 2s)
+  TUI_PASTE_DELAY   paste-to-Enter pause (default: 0.5s)
+  TUI_START_TIMEOUT max wait at startup  (default: 60s)
   TUI_DIR           working dir          (default: cwd)
   TUI_WIDTH         terminal width       (default: 200)
   TUI_HEIGHT        terminal height      (default: 50)
