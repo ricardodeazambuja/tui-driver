@@ -750,6 +750,49 @@ cmd_raw() {
     _capture
 }
 
+cmd_progress() {
+    # Read-only monitor for a caller watching a pending query. Unlike poll it
+    # never consumes the response or clears the pending record, and unlike
+    # raw it answers the actual question ("is it still working?") without a
+    # screen dump. Safe to run at any time, any number of times.
+    if ! tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
+        echo "session=stopped"
+        return 1
+    fi
+    echo "session=running"
+
+    local now async_file
+    now=$(date +%s)
+    async_file=$(_async_file)
+    if [ -f "$async_file" ]; then
+        local mtime prompt_head
+        mtime=$(stat -c %Y "$async_file" 2>/dev/null || stat -f %m "$async_file" 2>/dev/null || echo "$now")
+        echo "pending=yes"
+        echo "sent_ago=$((now - mtime))s"
+        prompt_head=$(head -c 60 "$async_file" | tr '\n' ' ')
+        echo "prompt=${prompt_head}"
+    else
+        echo "pending=no"
+    fi
+
+    local h1 h2
+    h1=$(_screen_hash)
+    sleep 1
+    h2=$(_screen_hash)
+    if [ "$h1" = "$h2" ]; then
+        echo "screen=still"
+    else
+        echo "screen=changing"
+    fi
+
+    echo "last_lines:"
+    _capture | grep -v '^[[:space:]]*$' | tail -3
+
+    # Checking on the session is caller activity — hold the watchdog off.
+    _stamp
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # Orphan discovery and cleanup (global — across all dirs and commands).
 #
@@ -935,6 +978,7 @@ case "$ACTION" in
     stop)       cmd_stop ;;
     status)     cmd_status ;;
     raw)        cmd_raw ;;
+    progress)   cmd_progress ;;
     list)       cmd_list ;;
     reap)       cmd_reap ;;
     install)    cmd_install ;;
@@ -962,6 +1006,9 @@ Actions:
   stop              Kill the session
   status            Print running / stopped
   raw               Raw screen capture (for debugging)
+  progress          Read-only check on a pending query: pending?, elapsed,
+                    screen still changing?, last screen lines. Never
+                    consumes the response — safe to run any time
   list              List all tui-driver sessions (any dir/command) + status
   reap              Kill orphaned sessions (dead watchdog + idle); never
                     touches live or recently-active sessions
@@ -1039,9 +1086,10 @@ How poll works (read this before driving from an agent):
   * If a query stalls on an approval dialog, a plain `poll` returns the
     dialog text (and clears the pending record); reply with
     `respond --async "y"` and then poll again for the real response.
-  * Do NOT inspect a pending query with `raw` to "check progress" — raw
-    never consumes the response or clears the lock, so the query stays
-    pending. Use poll/poll --wait to retrieve, raw only for debugging.
+  * To check on a pending query WITHOUT retrieving it, use `progress`
+    (safe, read-only). Do NOT use `raw` for that — it dumps the screen
+    without answering "is it still working?". Use poll/poll --wait to
+    retrieve, raw only for debugging.
   * Tune stability if responses get clipped or never settle: raise
     TUI_STABLE (more consecutive stable samples) or TUI_POLL (longer gap).
 
