@@ -145,6 +145,7 @@ _watchdog_file() { echo "/tmp/.tui-driver-${TUI_SESSION}.watchdog"; }
 _async_file()    { echo "/tmp/.tui-driver-${TUI_SESSION}.async"; }
 _poll_hash_file(){ echo "/tmp/.tui-driver-${TUI_SESSION}.poll-hash"; }
 _last_send_file(){ echo "/tmp/.tui-driver-${TUI_SESSION}.last-send"; }
+_prompt_file()   { echo "/tmp/.tui-driver-${TUI_SESSION}.prompt"; }
 _lock_file() {
     # Lock is keyed on command+directory, NOT session name.
     # This lets _default_session find the right session.
@@ -176,12 +177,13 @@ _start_watchdog() {
     # the stamp file: every send/respond updates it.  If no activity for
     # WATCHDOG_TIMEOUT seconds, assume the caller is gone and clean up.
     local session="$TUI_SESSION"
-    local stamp watchdog async poll_hash last_send
+    local stamp watchdog async poll_hash last_send prompt_f
     stamp=$(_stamp_file)
     watchdog=$(_watchdog_file)
     async=$(_async_file)
     poll_hash=$(_poll_hash_file)
     last_send=$(_last_send_file)
+    prompt_f=$(_prompt_file)
     local timeout="${TUI_WATCHDOG:-600}"  # 10 minutes default
 
     # Seed the stamp so the watchdog has a starting point
@@ -193,7 +195,7 @@ _start_watchdog() {
             # If the session is gone (stopped, crashed, killed elsewhere),
             # clean up our own per-session state so it does not leak into /tmp.
             if ! tmux has-session -t "$session" 2>/dev/null; then
-                rm -f "$stamp" "$async" "$poll_hash" "$watchdog" "$last_send"
+                rm -f "$stamp" "$async" "$poll_hash" "$watchdog" "$last_send" "$prompt_f"
                 _rm_owned_lock "$session"
                 break
             fi
@@ -205,14 +207,14 @@ _start_watchdog() {
                 idle=$((now - last))
                 if [ "$idle" -gt "$timeout" ]; then
                     tmux kill-session -t "$session" 2>/dev/null || true
-                    rm -f "$stamp" "$async" "$poll_hash" "$watchdog" "$last_send"
+                    rm -f "$stamp" "$async" "$poll_hash" "$watchdog" "$last_send" "$prompt_f"
                     _rm_owned_lock "$session"
                     break
                 fi
             else
                 # No stamp file — caller probably died without stopping
                 tmux kill-session -t "$session" 2>/dev/null || true
-                rm -f "$async" "$poll_hash" "$watchdog" "$last_send"
+                rm -f "$async" "$poll_hash" "$watchdog" "$last_send" "$prompt_f"
                 _rm_owned_lock "$session"
                 break
             fi
@@ -477,11 +479,24 @@ cmd_send() {
     sleep "$PASTE_DELAY"
     tmux send-keys -t "$TUI_SESSION" Enter
     _mark_send
+    # Remember the prompt: it is the extraction anchor for respond --async
+    # and for a send that times out and converts to a pending async query.
+    printf '%s\n' "$prompt" > "$(_prompt_file)"
 
     log "Prompt sent, waiting for screen to stabilise ..."
 
     local rc=0
     _await_response "$prompt" || rc=$?
+    if [ "$rc" -eq 3 ]; then
+        # Convert the timed-out send into a pending async query so the
+        # response is not lost: the caller can keep polling for it.
+        # Scrollback is kept too — the anchor must stay findable.
+        printf '%s\n' "$prompt" > "$(_async_file)"
+        rm -f "$(_poll_hash_file)"
+        err "Query still pending: poll for the rest, raise TUI_TIMEOUT, or 'cancel'."
+        _stamp
+        return 3
+    fi
     tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
     _stamp
     return "$rc"
@@ -489,15 +504,25 @@ cmd_send() {
 
 cmd_respond() {
     # Send a short reply (e.g. to an approval prompt). Pass "" to press Enter.
-    local reply="${1:-}"
+    # --async: return immediately and (re-)arm the pending-async record using
+    # the original prompt as anchor, so a follow-up poll / poll --wait picks
+    # up the response — the dialog flow for async queries.
+    local async_mode=false
+    if [ "${1:-}" = "--async" ]; then
+        async_mode=true
+        shift
+    fi
+    local reply="${*:-}"
 
     if ! tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
         err "Error: no session running."
         return 1
     fi
 
-    if [ -f "$(_async_file)" ]; then
-        err "Error: async query pending. Poll first: tui-driver $TUI_CMD poll --wait"
+    # A blocking respond would fight a pending async query; respond --async
+    # is fine (the reply just unblocks the dialog, the query stays pending).
+    if [ -f "$(_async_file)" ] && [ "$async_mode" = false ]; then
+        err "Error: async query pending. Poll first (tui-driver $TUI_CMD poll --wait) or use respond --async."
         return 1
     fi
 
@@ -507,6 +532,22 @@ cmd_respond() {
         sleep 0.3
     fi
     tmux send-keys -t "$TUI_SESSION" Enter
+
+    if [ "$async_mode" = true ]; then
+        local prompt_file
+        prompt_file=$(_prompt_file)
+        if [ -f "$prompt_file" ]; then
+            cp "$prompt_file" "$(_async_file)"
+        else
+            # No recorded prompt (respond before any send): fall back to the
+            # reply as anchor — poll returns everything after it.
+            printf '%s\n' "$reply" > "$(_async_file)"
+        fi
+        rm -f "$(_poll_hash_file)"
+        log "Reply sent (async). Use 'poll' or 'poll --wait' to retrieve the response."
+        _stamp
+        return 0
+    fi
 
     log "Reply sent, waiting for screen to stabilise ..."
 
@@ -571,9 +612,12 @@ cmd_send_async() {
     sleep "$PASTE_DELAY"
     tmux send-keys -t "$TUI_SESSION" Enter
     _mark_send
+    # Remember the prompt: it is the extraction anchor for respond --async
+    # and for a send that times out and converts to a pending async query.
+    printf '%s\n' "$prompt" > "$(_prompt_file)"
 
     # Save prompt anchor and reset poll state for this session
-    echo "$prompt" > "$async_file"
+    printf '%s\n' "$prompt" > "$async_file"
     rm -f "$(_poll_hash_file)"
 
     log "Prompt sent (async). Use 'poll' or 'poll --wait' to retrieve the response."
@@ -610,6 +654,13 @@ cmd_poll() {
         log "Waiting for screen to stabilise (poll --wait) ..."
         local rc=0
         _await_response "$prompt" || rc=$?
+        if [ "$rc" -eq 3 ]; then
+            # Keep the query pending (and the scrollback anchor intact):
+            # the caller can poll again for the rest of the response.
+            err "Query still pending: poll again, raise TUI_TIMEOUT, or 'cancel'."
+            _stamp
+            return 3
+        fi
         tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
         rm -f "$async_file" "$poll_hash_file"
         _stamp
@@ -662,6 +713,19 @@ cmd_poll() {
     return 2
 }
 
+cmd_cancel() {
+    # Drop a pending async query without touching the session. The TUI may
+    # still be generating; this only clears tui-driver's pending record so a
+    # new send is allowed.
+    if [ -f "$(_async_file)" ]; then
+        rm -f "$(_async_file)" "$(_poll_hash_file)"
+        log "Pending query cancelled (the TUI itself may still be generating)."
+    else
+        log "No pending query to cancel."
+    fi
+    return 0
+}
+
 cmd_stop() {
     _stop_watchdog
     if tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
@@ -670,7 +734,7 @@ cmd_stop() {
     else
         log "No session to stop"
     fi
-    rm -f "$(_stamp_file)" "$(_async_file)" "$(_poll_hash_file)" "$(_last_send_file)"
+    rm -f "$(_stamp_file)" "$(_async_file)" "$(_poll_hash_file)" "$(_last_send_file)" "$(_prompt_file)"
     _rm_owned_lock "$TUI_SESSION"
 }
 
@@ -735,7 +799,8 @@ _clear_session_state() {
           "/tmp/.tui-driver-${session}.watchdog" \
           "/tmp/.tui-driver-${session}.async" \
           "/tmp/.tui-driver-${session}.poll-hash" \
-          "/tmp/.tui-driver-${session}.last-send"
+          "/tmp/.tui-driver-${session}.last-send" \
+          "/tmp/.tui-driver-${session}.prompt"
     # Drop any cmd+dir lock that still points at this (dead) session.
     local lf
     shopt -s nullglob
@@ -864,8 +929,9 @@ case "$ACTION" in
     start)      cmd_start ;;
     send)       cmd_send "$*" ;;
     send-async) cmd_send_async "$*" ;;
-    poll)       cmd_poll "$*" ;;
-    respond)    cmd_respond "$*" ;;
+    poll)       cmd_poll "$@" ;;
+    respond)    cmd_respond "$@" ;;
+    cancel)     cmd_cancel ;;
     stop)       cmd_stop ;;
     status)     cmd_status ;;
     raw)        cmd_raw ;;
@@ -888,6 +954,11 @@ Actions:
   poll              Check if send-async response is ready (single check)
   poll --wait       Block until send-async response is ready
   respond "reply"   Reply to an approval/dialog, "" = just press Enter
+                    (blocking: prints the resulting screen itself)
+  respond --async "reply"
+                    Reply and return immediately, re-arming the pending
+                    query so poll / poll --wait retrieves the response
+  cancel            Drop a pending async query (session keeps running)
   stop              Kill the session
   status            Print running / stopped
   raw               Raw screen capture (for debugging)
@@ -962,6 +1033,12 @@ How poll works (read this before driving from an agent):
     response is what clears the pending lock.
   * For long-running queries, run `poll --wait` in the BACKGROUND and keep
     working; it blocks until the response lands (up to TUI_TIMEOUT).
+  * A timeout (exit 3) does NOT consume the query: it prints what is on
+    screen and keeps it pending. Poll again for the rest, raise
+    TUI_TIMEOUT, or run 'cancel' to drop it.
+  * If a query stalls on an approval dialog, a plain `poll` returns the
+    dialog text (and clears the pending record); reply with
+    `respond --async "y"` and then poll again for the real response.
   * Do NOT inspect a pending query with `raw` to "check progress" — raw
     never consumes the response or clears the lock, so the query stays
     pending. Use poll/poll --wait to retrieve, raw only for debugging.
