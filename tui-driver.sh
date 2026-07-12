@@ -200,6 +200,13 @@ _start_watchdog() {
     # Seed the stamp so the watchdog has a starting point
     date +%s > "$stamp"
 
+    # Redirect the watchdog's stdio away from the caller's fds. Otherwise the
+    # backgrounded subshell inherits our stdout/stderr and keeps them open for
+    # its whole lifetime (up to TUI_WATCHDOG). A programmatic caller that
+    # captures output (e.g. Node's execFile, which waits for pipe EOF, not just
+    # process exit) would then block until the watchdog dies or it times out —
+    # even though `start` itself returned in seconds. `disown` alone does not
+    # close the inherited fds, so redirect them explicitly.
     (
         while true; do
             sleep 30
@@ -230,7 +237,7 @@ _start_watchdog() {
                 break
             fi
         done
-    ) &
+    ) </dev/null >/dev/null 2>&1 &
 
     echo "$!" > "$watchdog"
     disown

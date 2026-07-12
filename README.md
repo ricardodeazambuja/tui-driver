@@ -518,6 +518,17 @@ avoidance, not a security boundary. Sessions started by a pre-0.3 version
 kept their state under `/tmp`; `list` and `reap` still scan that legacy
 layout, but drive such sessions with the old binary or reap them.
 
+### Watchdog stdio (programmatic callers)
+
+The background watchdog spawned by `start` redirects its own stdin/stdout/stderr
+to `/dev/null`. This matters for callers that **capture** tui-driver's output:
+Node's `child_process.execFile`, for example, resolves only when the stdout/stderr
+pipes reach EOF, not merely when the process exits. If the watchdog inherited
+those pipes it would hold them open for its whole lifetime (up to
+`TUI_WATCHDOG`), so `start` would appear to hang for minutes even though it
+finished in seconds. `disown` alone does not close inherited fds — the explicit
+redirect does.
+
 ### Watchdog for orphaned sessions
 
 If the calling process dies without running `stop`, the tmux session
