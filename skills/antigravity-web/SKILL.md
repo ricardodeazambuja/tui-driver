@@ -10,6 +10,8 @@ description: >
   check website, product status, datasheet lookup, component availability,
   NRND, lifecycle status, DigiKey, Mouser, LCSC, Octopart, read PDF, fetch
   document, summarize document, extract from PDF.
+  OUTPUT IS UNVERIFIED — everything this skill returns is a *suggestion* to be
+  independently and testably confirmed, never a fact to build on or report as truth.
 allowed-tools:
   - Bash(tui-driver*:*)
   - Read
@@ -24,6 +26,75 @@ WebSearch or WebFetch tools — Antigravity provides grounded Google Search with
 citations, can read JavaScript-rendered pages, and can process documents
 (PDFs, datasheets, etc.) directly from URLs.
 
+## ⚠️ READ FIRST — Everything This Skill Returns Is a Suggestion, Not Truth
+
+**The output of this skill is UNVERIFIED and may be entirely hallucinated.** It is a
+*lead* — a starting point for verification — never an answer you may rely on, act on,
+or pass to the user as fact.
+
+This holds for every kind of output, without exception:
+
+- **Numbers and specs** — voltages, currents, tolerances, pinouts, part numbers,
+  prices, stock levels, dates. These are the most commonly fabricated, and the
+  most damaging when wrong.
+- **Lifecycle / availability claims** — "active", "NRND", "obsolete", "in stock",
+  "replaced by X". Frequently invented or applied to the wrong part.
+- **URLs and citations** — a plausible-looking source URL may not exist, may not
+  contain the claim attributed to it, or may be a different document entirely.
+  **A citation is not evidence.** Open it.
+- **Quotes and paraphrases** from documents — wording gets invented, table rows get
+  merged, footnotes and conditions ("at 25 °C", "typical, not guaranteed") get dropped.
+- **Absence claims** — "there is no errata for this part", "no such document exists",
+  "nothing found". Absence of evidence from this tool is not evidence of absence.
+
+### What you MUST do before using any of it
+
+1. **Verify against the primary source yourself.** Get the source URL, then read the
+   actual page or PDF — with your own tools, or by having Antigravity save the raw
+   text to a file (`/tmp/foo.md`) that you then `Read` directly. Verifying Antigravity's
+   summary by asking Antigravity again is not verification.
+2. **Prefer testable confirmation over textual confirmation.** If the claim can be
+   checked by running something — a command, a build, a measurement, a datasheet
+   table you can see with your own eyes — check it that way. "It said so twice" is
+   not a test.
+3. **If you cannot verify it, do not use it.** Say plainly that it is unconfirmed,
+   attribute it ("Antigravity reported, unverified: …"), and stop there. Never silently
+   promote an unverified claim into a calculation, a design decision, a code change,
+   or a confident statement to the user.
+
+**Never** present this skill's output to the user as established fact, and never let
+it be the sole basis for a decision that costs money, time, or hardware.
+
+## Prerequisites — the `agy-web` wrapper (not shipped with this repo)
+
+The command token used throughout this skill is **`agy-web`**, not `agy`. It is a
+machine-local wrapper that launches the Antigravity CLI pinned to a specific model and
+reasoning effort. It is **not** installed by `tui-driver install` — create it once, by
+hand, on any machine where this skill runs:
+
+```bash
+cat > ~/.local/bin/agy-web <<'EOF'
+#!/usr/bin/env bash
+exec agy --model gemini-3.6-flash-high --effort high "$@"
+EOF
+chmod +x ~/.local/bin/agy-web
+```
+
+Adjust the model id to taste — `agy models` lists what is available (the effort level is
+baked into the id, e.g. `gemini-3.6-flash-{high,medium,low}`); an invalid id makes `agy`
+print the valid list and refuse, so a typo fails loudly rather than silently downgrading.
+
+**Why a wrapper instead of a flag or a config file:** `tui-driver <cmd> start` launches
+the bare command token and cannot forward flags to it, and putting them inside the token
+would corrupt the tmux session and lock-file names, which interpolate it. The CLI's own
+persistent default (`~/.gemini/antigravity-cli/settings.json`) is global and gets silently
+rewritten by any in-TUI `/model` switch, so it cannot be relied on either. Pinning at
+launch is the only thing that guarantees the model. To confirm which model a live session
+actually got, `tmux capture-pane -p -t <session>` — the status bar shows it.
+
+If `agy-web` is missing, `tui-driver agy-web start` fails with a command-not-found in the
+tmux pane. Create the wrapper; do NOT fall back to bare `agy`.
+
 ## Session Management
 
 Before sending any query, ensure an Antigravity session is running. If one is already
@@ -31,10 +102,10 @@ running, `start` will tell you — that's fine, just proceed with `send-async`.
 
 ```bash
 # Start an Antigravity session (safe to call if unsure — errors if already running)
-tui-driver agy start
+tui-driver agy-web start
 
 # When completely done with all web tasks, stop the session
-tui-driver agy stop
+tui-driver agy-web stop
 ```
 
 **Important:** Do NOT stop the session between queries. Keep it alive for the
@@ -53,10 +124,10 @@ tui-driver list
 
 # Clear sessions orphaned by a crashed/killed prior run
 # (only touches dead-watchdog, idle sessions — never a live one)
-tui-driver agy reap
+tui-driver agy-web reap
 
 # Force a clean restart of a live-but-wedged session
-tui-driver agy stop && tui-driver agy start
+tui-driver agy-web stop && tui-driver agy-web start
 ```
 
 `reap` is safe to run anytime: it never kills a session that is actively in
@@ -70,11 +141,11 @@ you when the response is ready.
 
 ```bash
 # Step 1: Fire the query (returns immediately)
-tui-driver agy send-async "Search for: <your detailed query here>"
+tui-driver agy-web send-async "Search for: <your detailed query here>"
 
 # Step 2: Wait for response in background (you'll be notified when done)
 # Run this as a SEPARATE Bash call with run_in_background=true
-tui-driver -q agy poll --wait
+tui-driver -q agy-web poll --wait
 ```
 
 **Workflow:** Call `send-async` in one Bash call, then immediately call
@@ -84,12 +155,12 @@ with other work — you'll be notified when the response arrives.
 **To check on a pending query without retrieving it**, use `progress` —
 read-only, safe to run any number of times:
 ```bash
-tui-driver agy progress   # pending?, sent_ago, screen changing?, last lines
+tui-driver agy-web progress   # pending?, sent_ago, screen changing?, last lines
 ```
 
 **If you need to retrieve without blocking:**
 ```bash
-tui-driver agy poll    # prints "waiting" (exit 2) if not ready, or the full response (exit 0)
+tui-driver agy-web poll    # prints "waiting" (exit 2) if not ready, or the full response (exit 0)
 ```
 
 **Exit codes (same for send/poll/respond):** `0` = response ready, `1` =
@@ -106,27 +177,27 @@ even with `-q`), `2` = still working (`poll`), `3` = timeout.
   still generating. You never need to call `poll` twice in a row.
 - A **timeout (exit 3) does not lose the query** — it stays pending. Poll
   again (or with a larger `TUI_TIMEOUT`) for the rest, or drop it with
-  `tui-driver agy cancel` if you no longer want it.
+  `tui-driver agy-web cancel` if you no longer want it.
 - **Never use `raw` to "monitor" a pending query** — use `progress` for that.
   Use `poll`/`poll --wait` to retrieve; `raw` only for debugging a session
   that already misbehaves.
 - If a query seems to return clipped or empty output, raise `TUI_STABLE`
   (more consecutive stable samples) or `TUI_POLL` (longer gap between samples)
-  on that invocation, e.g. `TUI_STABLE=3 tui-driver -q agy poll --wait`.
+  on that invocation, e.g. `TUI_STABLE=3 tui-driver -q agy-web poll --wait`.
 
 ### Web Search Examples
 
 ```bash
-tui-driver agy send-async "Search for MP2359 product lifecycle status NRND on DigiKey and Mouser"
-tui-driver agy send-async "Search for STM32G431 errata and known silicon bugs 2025 2026"
-tui-driver agy send-async "Search for IRS2104 gate driver reference design application notes"
+tui-driver agy-web send-async "Search for MP2359 product lifecycle status NRND on DigiKey and Mouser"
+tui-driver agy-web send-async "Search for STM32G431 errata and known silicon bugs 2025 2026"
+tui-driver agy-web send-async "Search for IRS2104 gate driver reference design application notes"
 ```
 
 ### Web Fetch Examples
 
 ```bash
-tui-driver agy send-async "Read https://www.digikey.com/en/products/detail/xxx and report the product status, price, and stock level"
-tui-driver agy send-async "Read https://www.monolithicpower.com/en/mp2359.html and check if it is marked NRND or has a recommended replacement"
+tui-driver agy-web send-async "Read https://www.digikey.com/en/products/detail/xxx and report the product status, price, and stock level"
+tui-driver agy-web send-async "Read https://www.monolithicpower.com/en/mp2359.html and check if it is marked NRND or has a recommended replacement"
 ```
 
 ## Document Fetching & Processing
@@ -143,16 +214,16 @@ useful information rather than a raw dump.
 
 ```bash
 # Extract specific specs from a datasheet
-tui-driver agy send-async "Read the PDF at https://example.com/irs2104.pdf and extract: input voltage range, output current rating, propagation delay, and recommended bootstrap capacitor value"
+tui-driver agy-web send-async "Read the PDF at https://example.com/irs2104.pdf and extract: input voltage range, output current rating, propagation delay, and recommended bootstrap capacitor value"
 
 # Summarize a technical document
-tui-driver agy send-async "Read https://example.com/app-note-AN1234.pdf and summarize the key design recommendations for half-bridge gate driver layout"
+tui-driver agy-web send-async "Read https://example.com/app-note-AN1234.pdf and summarize the key design recommendations for half-bridge gate driver layout"
 
 # Compare specs across documents
-tui-driver agy send-async "Read https://example.com/mosfet-a.pdf and extract: Vds max, Rds(on) at 10V Vgs, Qg total, and package type"
+tui-driver agy-web send-async "Read https://example.com/mosfet-a.pdf and extract: Vds max, Rds(on) at 10V Vgs, Qg total, and package type"
 
 # Extract tables or pinouts
-tui-driver agy send-async "Read https://example.com/connector-spec.pdf and extract the pin assignments table for the 8-pin variant"
+tui-driver agy-web send-async "Read https://example.com/connector-spec.pdf and extract the pin assignments table for the 8-pin variant"
 ```
 
 ### Tips for Document Processing
@@ -170,28 +241,30 @@ with `respond --async`, which re-arms the pending query so the next
 `poll` / `poll --wait` retrieves the real response:
 
 ```bash
-tui-driver agy respond --async "y"     # approve
-tui-driver agy respond --async "n"     # deny
-tui-driver agy respond --async ""      # press Enter (accept default)
+tui-driver agy-web respond --async "y"     # approve
+tui-driver agy-web respond --async "n"     # deny
+tui-driver agy-web respond --async ""      # press Enter (accept default)
 ```
 
 After responding, run `poll --wait` (in the background) to get the actual
 response. (Plain `respond` without `--async` blocks and prints the resulting
 screen itself — fine for quick dialogs in synchronous flows.)
 
-## Accuracy Warning — Antigravity Uses a Simpler Model
+## Verification Recipes (see the READ FIRST warning above)
 
-Antigravity runs with a lighter model by default, which means **its summarizations can
-be inaccurate** — numbers get rounded, specs get mixed up, details get lost or
-conflated. Treat Antigravity's summaries as a starting point, not ground truth.
+Antigravity runs a fast model and **its summarizations are routinely inaccurate** —
+numbers get rounded, specs get mixed up, details get lost, conflated, or invented
+outright. Pinning the model to a stronger tier reduces this; it does not remove it.
+No prompt makes the output trustworthy. Only checking the source does.
 
-**When accuracy matters** (component specs, pin assignments, voltage/current
-ratings, lifecycle status, pricing, or any data you'll use for design decisions):
+**This applies to everything, and non-negotiably to** component specs, pin
+assignments, voltage/current ratings, lifecycle status, pricing, or any data you'll
+use for design decisions:
 
 1. **Ask Antigravity to save raw results to a file** so you can read and verify them
    yourself. For example:
    ```bash
-   tui-driver agy send-async "Search for IRS2104 absolute maximum ratings. Save the raw search results to /tmp/irs2104_specs.md"
+   tui-driver agy-web send-async "Search for IRS2104 absolute maximum ratings. Save the raw search results to /tmp/irs2104_specs.md"
    ```
    Then read `/tmp/irs2104_specs.md` directly with the Read tool to verify.
 
@@ -201,9 +274,14 @@ ratings, lifecycle status, pricing, or any data you'll use for design decisions)
 3. **Cross-check numbers** — if Antigravity says "Vds max = 30V", don't trust it
    blindly. Ask for the raw data or verify against a local datasheet PDF.
 
-**Rule of thumb:** If you would run a calculation or make a design decision based
-on a value Antigravity returned, get the raw data first. Don't build on top of a
-potentially garbled summary.
+4. **Check that the citation says what it's claimed to say** — fetching the URL is
+   only half of it; the claim has to actually be on the page. A URL that 404s, or a
+   real page that never mentions the number, means the claim was fabricated.
+
+**Rule of thumb:** If you would run a calculation, write code, or make a design
+decision based on a value Antigravity returned, get the raw data first. Don't build on
+top of a potentially garbled summary. If verification isn't possible right now, label
+the value as unverified and let the user decide — do not quietly use it anyway.
 
 ## Rules
 
@@ -213,8 +291,11 @@ potentially garbled summary.
 4. **Be specific** in the prompt — tell Antigravity exactly what information you need.
 5. **Include citations** — ask Antigravity to include source URLs when searching.
 6. **Multiple URLs** — you can include several URLs in a single send.
-7. **Report results** — summarize Antigravity's output for the user, including source URLs.
+7. **Report results as unverified** — when you summarize Antigravity's output for the
+   user, attribute it and say what you did or did not confirm. Include source URLs.
+   Never state it as your own finding or as established fact.
 8. **The output includes TUI chrome** (borders, status bars) — just ignore those lines and extract the actual response content.
 9. **For documents** — always specify what to extract; don't ask Antigravity to dump entire documents.
-10. **Be patient** — Antigravity searches take time (1-3 minutes for complex queries with multiple Google searches). After launching `poll --wait` in the background, trust the background notification and do other work while waiting. If you genuinely need to check on it (e.g. suspecting a stall), use `tui-driver agy progress` — never `raw`.
-11. **Verify critical data** — when accuracy matters, ask Antigravity to save raw output to a file (e.g. `/tmp/result.md`) so you can read and verify it yourself. Don't rely solely on Antigravity's summaries for design decisions.
+10. **Be patient** — Antigravity searches take time (1-3 minutes for complex queries with multiple Google searches). After launching `poll --wait` in the background, trust the background notification and do other work while waiting. If you genuinely need to check on it (e.g. suspecting a stall), use `tui-driver agy-web progress` — never `raw`.
+11. **Verify before you use, always** — the output is a suggestion, not truth. Ask Antigravity to save raw output to a file (e.g. `/tmp/result.md`), read it yourself, and confirm against the primary source — testably where a test is possible. If you can't verify it, label it unverified and don't build on it. See the READ FIRST section at the top.
+12. **Never use plain `agy`** — the command token is `agy-web`, a wrapper that pins the model to Gemini 3.6 Flash at high reasoning effort (see Prerequisites above; create it if missing). Bare `agy` follows a mutable global default that any in-TUI `/model` switch silently changes.
