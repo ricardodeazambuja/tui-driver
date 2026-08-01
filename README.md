@@ -365,6 +365,13 @@ skills that drive a TUI through `tui-driver`. Drop one into your project's (or
   via an Antigravity CLI (`agy`) session: grounded Google Search with
   citations, JavaScript-rendered pages, and PDF/datasheet extraction that the
   built-in fetch can't handle. Use it in place of the built-in WebSearch/WebFetch.
+  **Needs a one-line wrapper on your PATH** that pins the model — `tui-driver`
+  launches the bare command token and can't forward flags to it:
+
+  ```bash
+  printf '#!/usr/bin/env bash\nexec agy --model gemini-3.6-flash-high --effort high "$@"\n' \
+      > ~/.local/bin/agy-web && chmod +x ~/.local/bin/agy-web
+  ```
 - **`claude-delegate`** — hand a self-contained task to an *independent*
   `claude` CLI session (its own fresh context window) and collect the result:
   for isolated sub-tasks you don't want bloating your own context, genuinely
