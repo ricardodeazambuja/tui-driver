@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 # Baked in at install time by cmd_install (git short hash, +-dirty if the
 # source tree had uncommitted changes). Empty when running straight from a
 # checkout, in which case _build_stamp falls back to live git.
@@ -434,6 +434,15 @@ if lines:
 '
 }
 
+# Paste text into this session's pane via a buffer named after the session.
+# The unnamed buffer is a tmux-wide stack: two drivers sending at the same
+# moment (parallel --session sessions) would race, and one pane could receive
+# the other's prompt. A per-session buffer name makes concurrent sends safe.
+_paste() {
+    printf '%s' "$1" | tmux load-buffer -b "$TUI_SESSION" -
+    tmux paste-buffer -b "$TUI_SESSION" -t "$TUI_SESSION" -p -d
+}
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -507,8 +516,7 @@ cmd_send() {
     _throttle
 
     # Send via bracketed paste (safe with !, ?, @, etc.)
-    printf '%s' "$prompt" | tmux load-buffer -
-    tmux paste-buffer -t "$TUI_SESSION" -p
+    _paste "$prompt"
     sleep "$PASTE_DELAY"
     tmux send-keys -t "$TUI_SESSION" Enter
     _mark_send
@@ -560,8 +568,7 @@ cmd_respond() {
     fi
 
     if [ -n "$reply" ]; then
-        printf '%s' "$reply" | tmux load-buffer -
-        tmux paste-buffer -t "$TUI_SESSION" -p
+        _paste "$reply"
         sleep 0.3
     fi
     tmux send-keys -t "$TUI_SESSION" Enter
@@ -640,8 +647,7 @@ cmd_send_async() {
     _throttle
 
     # Send via bracketed paste (safe with !, ?, @, etc.)
-    printf '%s' "$prompt" | tmux load-buffer -
-    tmux paste-buffer -t "$TUI_SESSION" -p
+    _paste "$prompt"
     sleep "$PASTE_DELAY"
     tmux send-keys -t "$TUI_SESSION" Enter
     _mark_send
