@@ -133,24 +133,30 @@ tui-driver agy-web stop && tui-driver agy-web start
 `reap` is safe to run anytime: it never kills a session that is actively in
 use. For a session that is alive but stuck, `stop` then `start` is the fix.
 
-## Sending Queries (Async Pattern)
+## Sending Queries — ONE call, ALWAYS in the background
 
-**Always use `send-async` + `poll --wait` (run in background).** This avoids
-blocking while Antigravity processes the query. The background Bash call will notify
-you when the response is ready.
+**Every query is a single Bash call with `run_in_background: true`.** Copy this
+shape verbatim:
 
 ```bash
-# Step 1: Fire the query (returns immediately)
-tui-driver agy-web send-async "Search for: <your detailed query here>"
-
-# Step 2: Wait for response in background (you'll be notified when done)
-# Run this as a SEPARATE Bash call with run_in_background=true
-tui-driver -q agy-web poll --wait
+tui-driver -q agy-web start 2>/dev/null
+tui-driver -q agy-web send-async "Search for: <your detailed query here>" \
+  && tui-driver -q agy-web poll --wait
 ```
 
-**Workflow:** Call `send-async` in one Bash call, then immediately call
-`poll --wait` in a second Bash call with `run_in_background: true`. Continue
-with other work — you'll be notified when the response arrives.
+That one backgrounded call starts the session if needed, sends the query, waits,
+and hands you the whole response through the completion notification.
+
+**Why one call and not the old two-step:** there is nothing left to forget. The
+`start` prefix is a free no-op on a live session (exit 1 in ~0 s, session
+untouched), `send-async` takes the pending lock so a second query cannot corrupt
+the pane, and `&&` means a failed send never leaves a stray poll behind.
+
+**Never run `send`, `respond`, or `poll --wait` in the foreground.** Foreground
+blocking stalls the whole turn and the Bash tool kills it at 2 minutes, so you
+burn the wait and still have no answer. After firing the call, **go do other
+work** — writing files, reading code, planning. Do not idle, and do not poll to
+"check". The notification will find you.
 
 **To check on a pending query without retrieving it**, use `progress` —
 read-only, safe to run any number of times:
@@ -184,6 +190,72 @@ even with `-q`), `2` = still working (`poll`), `3` = timeout.
 - If a query seems to return clipped or empty output, raise `TUI_STABLE`
   (more consecutive stable samples) or `TUI_POLL` (longer gap between samples)
   on that invocation, e.g. `TUI_STABLE=3 tui-driver -q agy-web poll --wait`.
+
+### Several independent lookups at once
+
+One session answers one query at a time — the pending lock is per session. When
+you have N *unrelated* lookups, don't queue them: give each its own session with
+`--session NAME` (which bypasses the per-directory lock) and fire N background
+Bash calls **in a single message** so they run concurrently.
+
+```bash
+# call 1 (background)
+tui-driver --session web1 -q agy-web start 2>/dev/null
+tui-driver --session web1 -q agy-web send-async "<query 1>" \
+  && tui-driver --session web1 -q agy-web poll --wait
+
+# call 2 (background) — same shape, --session web2, and so on
+```
+
+Three parallel lookups cost about what one costs. Rules:
+
+- Pass the same `--session NAME` to **every** action for that session —
+  `send-async`, `poll`, `progress`, `stop`. Omitting it silently talks to the
+  default session instead.
+- **Stop them explicitly when done** (`tui-driver --session web1 agy-web stop`);
+  each is a full Antigravity process. The 600 s idle watchdog is a backstop, not
+  a plan.
+- Keep it to ~3 concurrent sessions. More buys little and costs memory.
+- Needs tui-driver ≥ 0.3.1. Earlier versions pasted through tmux's *unnamed*
+  buffer, which is shared process-wide: parallel sends raced and a session could
+  receive another session's prompt — silently, with a plausible answer to the
+  wrong question. Check with `tui-driver --version`.
+
+### Where the wall-clock actually goes
+
+Measured on this machine (Gemini 3.6 Flash, high effort):
+
+| Step | Cost |
+|------|------|
+| cold `start` | ~6 s, once |
+| `start` when already running | ~0 s (exits 1, session untouched) |
+| `send-async` | <1 s |
+| trivial question, default `TUI_POLL=2 TUI_STABLE=2` | ~6 s |
+| same question, `TUI_POLL=1` | ~3 s |
+| grounded search, 2 Google queries + answer | ~12 s |
+| 3 such searches in parallel sessions | ~20 s total |
+
+So a normal search is **seconds, not minutes** — heavy PDF extraction is where
+minutes happen. Most of that time is Antigravity thinking and searching and is
+not tunable from here. What *is* tunable is the settle tail — the
+`TUI_STABLE × TUI_POLL` seconds of unchanged screen that `poll` waits out after
+the answer is complete:
+
+- `TUI_POLL=1` halves it and cost nothing in the tests above, including on a
+  multi-line datasheet answer. If a reply ever comes back clipped, drop back to
+  the default or raise `TUI_STABLE`.
+- `--until` removes the tail entirely — it's a **global** flag, so it goes
+  before the command token:
+  ```bash
+  tui-driver -q agy-web send-async "<query>; end your reply with the word DONE followed by three exclamation marks"
+  tui-driver --until 'DONE!!!' -q agy-web poll --wait
+  ```
+  Word the prompt so the literal marker never appears in it, or the pattern
+  matches the echoed prompt immediately.
+
+None of this matters as much as the one habit that does: **fire the call in the
+background and go do something else.** A 12-second search costs zero if you
+spend those 12 seconds on other work, and a 3-minute one costs zero too.
 
 ### Web Search Examples
 
@@ -286,8 +358,12 @@ the value as unverified and let the user decide — do not quietly use it anyway
 ## Rules
 
 1. **Always prefer Antigravity** over built-in WebSearch/WebFetch for any web access or document reading.
-2. **Always use send-async + poll --wait (background)** — never use blocking `send`.
-3. **Start the session once**, send multiple queries, stop when done.
+2. **One backgrounded Bash call per query** — `start; send-async && poll --wait`, with
+   `run_in_background: true`. Never run `send`, `respond`, or `poll --wait` in the
+   foreground: it stalls the turn and the Bash tool kills it at 2 minutes.
+3. **Start the session once**, send multiple queries, stop when done. For unrelated
+   lookups, run them concurrently in separate `--session NAME` sessions rather than
+   one after another.
 4. **Be specific** in the prompt — tell Antigravity exactly what information you need.
 5. **Include citations** — ask Antigravity to include source URLs when searching.
 6. **Multiple URLs** — you can include several URLs in a single send.
@@ -296,6 +372,9 @@ the value as unverified and let the user decide — do not quietly use it anyway
    Never state it as your own finding or as established fact.
 8. **The output includes TUI chrome** (borders, status bars) — just ignore those lines and extract the actual response content.
 9. **For documents** — always specify what to extract; don't ask Antigravity to dump entire documents.
-10. **Be patient** — Antigravity searches take time (1-3 minutes for complex queries with multiple Google searches). After launching `poll --wait` in the background, trust the background notification and do other work while waiting. If you genuinely need to check on it (e.g. suspecting a stall), use `tui-driver agy-web progress` — never `raw`.
+10. **Never wait idly** — a typical grounded search lands in ~10-20 s and a heavy PDF
+    extraction in minutes, but either way the call is in the background: do other work
+    and trust the completion notification. Do not re-poll to "check". If you genuinely
+    suspect a stall, `tui-driver agy-web progress` is read-only and safe — never `raw`.
 11. **Verify before you use, always** — the output is a suggestion, not truth. Ask Antigravity to save raw output to a file (e.g. `/tmp/result.md`), read it yourself, and confirm against the primary source — testably where a test is possible. If you can't verify it, label it unverified and don't build on it. See the READ FIRST section at the top.
 12. **Never use plain `agy`** — the command token is `agy-web`, a wrapper that pins the model to Gemini 3.6 Flash at high reasoning effort (see Prerequisites above; create it if missing). Bare `agy` follows a mutable global default that any in-TUI `/model` switch silently changes.

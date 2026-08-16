@@ -220,6 +220,12 @@ tui-driver --session agent2 agy stop
 
 Each named session keeps its own state and watchdog; they never collide.
 
+> **Requires 0.3.1 or newer.** Up to 0.3.0 every send pasted through tmux's
+> *unnamed* buffer, which is a server-wide stack. Two sessions sending at the
+> same instant could race, and a pane could receive the other session's prompt —
+> silently, producing a confident answer to a question you never asked. Sends now
+> use a buffer named after the session. Check with `tui-driver --version`.
+
 ### Listing and reaping sessions
 
 Every session tui-driver starts is watched by a background watchdog that
@@ -382,6 +388,40 @@ Both follow the same `send-async` + `poll --wait` (in background) pattern
 described above and include session-recovery steps. See each
 `skills/<name>/SKILL.md` for full usage.
 
+### Keeping the agent from blocking on you (`hooks/tui-driver-bg.sh`)
+
+A skill can *tell* an agent to background its calls; it cannot make it. When the
+agent runs `poll --wait` in the foreground it stalls its own turn and Claude
+Code kills the call at its two-minute tool timeout — the query survives (it stays
+pending), but the turn is wasted.
+
+`hooks/tui-driver-bg.sh` is a Claude Code `PreToolUse` hook that removes the
+choice: it parses the Bash command, and if it is a tui-driver invocation using a
+blocking action (`send`, `respond` without `--async`, or `poll --wait`) that is
+not already backgrounded, it rewrites the tool input to set
+`run_in_background: true`. Non-blocking actions, other people's commands, and
+prompts that merely contain the word "send" are left alone — `hooks/test-hook.sh`
+covers those cases.
+
+```bash
+install -m 755 hooks/tui-driver-bg.sh ~/.claude/hooks/tui-driver-bg.sh
+```
+
+then in `~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "PreToolUse": [
+    {
+      "matcher": "Bash",
+      "hooks": [{ "type": "command", "command": "~/.claude/hooks/tui-driver-bg.sh" }]
+    }
+  ]
+}
+```
+
+Hooks are snapshotted at startup, so restart Claude Code afterwards.
+
 ## Full API reference
 
 ### Actions
@@ -487,6 +527,24 @@ yet (backend call, thinking pause) also has a stable screen, and returning
 early there is how partial/empty answers happen. And when even that is not
 enough — screens that never settle, long mid-response pauses — `--until`
 (above) replaces the heuristic with an exact completion marker.
+
+### One tmux paste buffer per session
+
+Input is delivered with `load-buffer` + `paste-buffer -p` (bracketed paste) rather
+than `send-keys`, so a prompt containing `!`, `?`, `@`, quotes or newlines reaches
+the TUI verbatim instead of being interpreted as keystrokes.
+
+The subtlety is *which* buffer. Up to 0.3.0 these calls used tmux's unnamed
+buffer, which is not per-session or per-process — it is a stack shared by the
+whole tmux server. Two drivers pasting at the same instant interleave: A loads,
+B loads, A pastes and gets B's text. With parallel `--session` sessions that
+surfaced as one session answering another session's question, and because the
+answer was fluent and well-formed there was nothing to alert the caller. Sends
+now use a buffer named after the session and delete it on paste (`-b "$SESSION"
+… -d`), which makes concurrent sends independent.
+
+The lesson generalises: anything tui-driver touches outside its own tmux session
+is shared state, and parallel sessions are a supported use case.
 
 ### Robustness over clean output
 
@@ -659,6 +717,17 @@ TD=tui-driver ./test/smoke.sh    # test an installed copy
 
 It uses throwaway `--session` names only, so it is safe to run while
 real sessions are active.
+
+The Claude Code hook has its own test, which needs neither tmux nor a TUI — it
+feeds sample `PreToolUse` payloads to the hook and asserts which ones get
+rewritten to run in the background:
+
+```bash
+./hooks/test-hook.sh
+```
+
+Both suites are shellcheck-clean; `./test/smoke.sh` runs shellcheck over
+`tui-driver.sh` as its last case.
 
 ## License
 
