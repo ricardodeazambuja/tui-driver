@@ -370,7 +370,7 @@ skills that drive a TUI through `tui-driver`. Drop one into your project's (or
 - **`antigravity-web`** — web search, URL fetching, and online-document reading
   via an Antigravity CLI (`agy`) session: grounded Google Search with
   citations, JavaScript-rendered pages, and PDF/datasheet extraction that the
-  built-in fetch can't handle. Use it in place of the built-in WebSearch/WebFetch.
+  built-in fetch can't handle. Last resort only: try the built-in WebSearch/WebFetch first.
   **Needs a one-line wrapper on your PATH** that pins the model — `tui-driver`
   launches the bare command token and can't forward flags to it:
 

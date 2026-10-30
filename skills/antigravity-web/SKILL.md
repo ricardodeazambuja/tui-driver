@@ -1,15 +1,11 @@
 ---
 name: antigravity-web
 description: >
-  Web search, web page fetching, and document reading using Antigravity CLI with
-  grounded Google Search. Use INSTEAD of built-in WebSearch and WebFetch
-  whenever you need to search the web, fetch/read URLs, or read online
-  documents (PDFs, datasheets, specs). Antigravity handles JavaScript-heavy pages,
-  dynamic content, and document summarization that WebFetch cannot.
-  Trigger on: web search, search for, look up online, fetch URL, read URL,
-  check website, product status, datasheet lookup, component availability,
-  NRND, lifecycle status, DigiKey, Mouser, LCSC, Octopart, read PDF, fetch
-  document, summarize document, extract from PDF.
+  LAST RESORT for web search, web page fetching, and document reading, using
+  Antigravity CLI with grounded Google Search. Do NOT use it as the first option:
+  try built-in WebSearch and WebFetch (or the web-fetch agent) first, and only
+  use this when they have failed or come back thin, for example on
+  JavaScript-heavy pages, dynamic content, or sites that refuse automated fetches.
   OUTPUT IS UNVERIFIED — everything this skill returns is a *suggestion* to be
   independently and testably confirmed, never a fact to build on or report as truth.
 allowed-tools:
@@ -20,11 +16,11 @@ allowed-tools:
 
 # Antigravity Web Search, Fetch & Document Skill
 
-Use the `tui-driver` script to drive an Antigravity CLI session for ALL web search,
-URL fetching, and online document reading tasks. Do NOT use the built-in
-WebSearch or WebFetch tools — Antigravity provides grounded Google Search with
-citations, can read JavaScript-rendered pages, and can process documents
-(PDFs, datasheets, etc.) directly from URLs.
+**Last resort only.** Use the built-in WebSearch and WebFetch tools first. Reach for
+this skill only after they have failed or come back thin. When that happens, use the
+`tui-driver` script to drive an Antigravity CLI session — Antigravity provides grounded
+Google Search with citations, can read JavaScript-rendered pages, and can process
+documents (PDFs, datasheets, etc.) directly from URLs.
 
 ## ⚠️ READ FIRST — Everything This Skill Returns Is a Suggestion, Not Truth
 
@@ -357,7 +353,7 @@ the value as unverified and let the user decide — do not quietly use it anyway
 
 ## Rules
 
-1. **Always prefer Antigravity** over built-in WebSearch/WebFetch for any web access or document reading.
+1. **Last resort only** — use built-in WebSearch/WebFetch first; use Antigravity only after they have failed or come back thin.
 2. **One backgrounded Bash call per query** — `start; send-async && poll --wait`, with
    `run_in_background: true`. Never run `send`, `respond`, or `poll --wait` in the
    foreground: it stalls the turn and the Bash tool kills it at 2 minutes.
