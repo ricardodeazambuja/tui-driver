@@ -104,6 +104,13 @@ screen; `start` launches a fresh session.
 Before sending any query, ensure an Antigravity session is running. If one is already
 running, `start` will tell you — that's fine, just proceed with `send-async`.
 
+**First run in a new directory:** `agy` shows a trust dialog ("Do you trust the contents
+of this project? ❯ Yes, I trust this folder / No, exit"). A query sent while it is up is
+swallowed by it (tui-driver then warns that the prompt was not found on screen). After a
+`start` in a directory agy has not seen, look once with `tui-driver agy-web raw` and, if
+the dialog is there and the directory is one the user trusts, confirm the highlighted
+"Yes" with `tui-driver agy-web respond --key Enter`.
+
 ```bash
 # Start an Antigravity session (safe to call if unsure — errors if already running)
 tui-driver agy-web start

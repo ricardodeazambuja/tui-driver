@@ -73,11 +73,14 @@ a trust/onboarding dialog ("Do you trust the files in this folder?"). After
 `start`, peek once and clear it if present:
 
 ```bash
-tui-driver claude raw              # one look: is a trust/onboarding dialog showing?
-tui-driver claude respond --key 1  # if so, pick "1. Yes, I trust this folder"
-
-Read the dialog before answering; pick the option number it shows.
+tui-driver claude raw                       # one look: is a trust/onboarding dialog showing?
+tui-driver claude respond --key Down Enter  # if so: move to "Yes, I trust this folder", confirm
 ```
+
+The trust dialog is NOT numbered and its default is **"❯ No, exit"**: pressing
+Enter alone (`respond ""`) quits the sub-Claude. Read the dialog, move the `❯`
+to the option you want (`Down`/`Up`), then `Enter`. Only trust a directory the
+user actually trusts.
 
 **Parallel / multiple delegates.** The default session is keyed on
 command+directory, so a second `tui-driver claude start` in the same directory
