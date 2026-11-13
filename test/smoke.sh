@@ -24,7 +24,7 @@ check() { # check <description> <condition...>
 
 cleanup() {
     local s
-    for s in pong delay spin dialog until pfx10 pfx1; do
+    for s in pong delay spin dialog until pfx10 pfx1 miss once norm; do
         $TD -q --session "${RUN_ID}-${s}" true stop >/dev/null 2>&1 || true
     done
     $TD -q --dir "$TMPDIR_T/dflt" "$TMPDIR_T/pong-tui.sh" stop >/dev/null 2>&1 || true
@@ -57,6 +57,10 @@ read -r a
 sleep 1
 echo "final-answer-42"
 read -r _
+EOF
+cat > "$TMPDIR_T/once-tui.sh" <<'EOF'
+#!/usr/bin/env bash
+read -r x; echo "bye-from-once"; exit 0
 EOF
 cat > "$TMPDIR_T/until-tui.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -171,7 +175,31 @@ check "default session for ./path.sh stopped"   [ "$out" = "stopped" ]
 $TD -q --session "bad.name" "$PONG" status >/dev/null 2>&1; rc=$?
 check "session name with '.' rejected (exit 1)" [ "$rc" -eq 1 ]
 
-# 11. stop cleans state; shellcheck -------------------------------------------
+# 11. TUI exit: never falls back to a shell; last screen is kept ---------------
+S="${RUN_ID}-miss"
+errmsg=$($TD -q --session "$S" nonexistent-tui-xyz start 2>&1 >/dev/null); rc=$?
+check "start of a missing command exits 1"      [ "$rc" -eq 1 ]
+check "  says it exited with status 127"        grep -q "exited (status 127)" <<<"$errmsg"
+out=$($TD -q --session "$S" nonexistent-tui-xyz status 2>/dev/null)
+check "  status reports exited"                 [ "$out" = "exited" ]
+out=$($TD -q --session "$S" nonexistent-tui-xyz raw 2>/dev/null)
+check "  raw prints the saved last screen"      grep -q "not found" <<<"$out"
+$TD -q --session "$S" nonexistent-tui-xyz stop >/dev/null 2>&1
+S="${RUN_ID}-once"
+$TD -q --session "$S" "$TMPDIR_T/once-tui.sh" start >/dev/null 2>&1
+$TD -q --session "$S" "$TMPDIR_T/once-tui.sh" send "first" >/dev/null 2>&1
+$TD -q --session "$S" "$TMPDIR_T/once-tui.sh" send "touch $TMPDIR_T/ran-as-shell" >/dev/null 2>&1; rc=$?
+check "send after the TUI exited exits 1"       [ "$rc" -eq 1 ]
+check "  prompt was not run by a shell"         [ ! -e "$TMPDIR_T/ran-as-shell" ]
+$TD -q --session "$S" "$TMPDIR_T/once-tui.sh" stop >/dev/null 2>&1
+S="${RUN_ID}-norm"
+$TD -q --session "$S" "$PONG" start >/dev/null 2>&1
+$TD -q --session "$S" "$PONG" stop >/dev/null 2>&1
+sleep 1
+check "normal stop leaves no exit record"       [ ! -e "$STATE_DIR/${S}.exit" ]
+rm -f "$STATE_DIR/${RUN_ID}"-*.exit "$STATE_DIR/${RUN_ID}"-*.screen
+
+# 12. stop cleans state; shellcheck -------------------------------------------
 check "no state files left for this run"        bash -c "! ls '$STATE_DIR'/${RUN_ID}-* >/dev/null 2>&1"
 if command -v shellcheck >/dev/null 2>&1; then
     check "shellcheck clean"                    shellcheck -S style "$TD"

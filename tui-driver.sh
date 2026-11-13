@@ -61,6 +61,63 @@ DONE_PATTERN="${TUI_DONE_PATTERN:-}"    # regex in the response = done (opt-in)
 STATE_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache}/tui-driver"
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Pane supervisor (internal): tui-driver __run SESSION DIR COMMAND
+#
+# start does not type the TUI command into the pane's shell any more. It
+# types "exec tui-driver __run ...", which replaces the shell with this
+# block, and this block runs the TUI as its child. Two reasons:
+#
+#  * No shell is left behind the TUI. Before, when the TUI exited, crashed
+#    or was never found, the pane fell back to the interactive shell and the
+#    next send EXECUTED THE PROMPT AS A SHELL COMMAND, with exit 0.
+#  * The TUI's last screen survives it. When the TUI exits for any reason
+#    of its own (clean exit, crash, signal, command not found), this block
+#    saves the whole pane (scrollback included) to <STATE_DIR>/<session>.screen
+#    and the exit status to <session>.exit, then exits, which closes the pane
+#    and the session. Every action then reports "exited (status N)" and where
+#    the screen is; `raw` prints it.
+#
+# Why not tmux's remain-on-exit, which keeps a dead pane readable: on tmux
+# 3.2a, pasting into a dead pane crashes the whole tmux server, killing every
+# session on it, and a paste racing the TUI's exit cannot be ruled out.
+#
+# stop and the watchdog end a session with kill-session; the SIGHUP kills
+# this block before it can write anything, so only exits of the TUI's own
+# leave a record. The whole if-block is parsed before it runs and ends in
+# exit, so bash never reads further into this file: reinstalling tui-driver
+# while a session is live is safe.
+# ---------------------------------------------------------------------------
+if [ "${1:-}" = "__run" ]; then
+    _sv_base="${STATE_DIR}/${2:?}"
+    _sv_dir="${3:?}"
+    _sv_cmd="${4:?}"
+    rm -f "${_sv_base}.exit" "${_sv_base}.screen"
+    # A handler (not an ignore: ignored signals are inherited across exec)
+    # so a Ctrl-C meant for the TUI does not end the supervisor first.
+    trap ':' INT
+    set +euo pipefail
+    if cd "$_sv_dir"; then
+        eval "$_sv_cmd"
+        _sv_rc=$?
+    else
+        _sv_rc=127
+    fi
+    # Write the record only if the pane could still be captured: a
+    # kill-session (stop, watchdog) must not leave an "exited" record behind.
+    if tmux capture-pane -p -S - -t "${TMUX_PANE:-}" > "${_sv_base}.screen.tmp" 2>/dev/null; then
+        mv -f "${_sv_base}.screen.tmp" "${_sv_base}.screen"
+        printf 'status=%s\ntime=%s\ncommand=%s\ndir=%s\n' \
+            "$_sv_rc" "$(date '+%Y-%m-%d %H:%M:%S')" "$_sv_cmd" "$_sv_dir" \
+            > "${_sv_base}.exit.tmp"
+        mv -f "${_sv_base}.exit.tmp" "${_sv_base}.exit"
+    else
+        rm -f "${_sv_base}.screen.tmp"
+    fi
+    exit "$_sv_rc"
+fi
+
 QUIET="${TUI_QUIET:-false}"             # suppress stderr logs (for agents)
 SESSION_EXPLICIT=false                   # true once --session NAME is given
 
@@ -140,7 +197,11 @@ _default_session() {
     if [ -f "$lock" ]; then
         local existing
         existing=$(cat "$lock")
-        if tmux has-session -t "=$existing" 2>/dev/null; then
+        # A session whose TUI exited still owns its name while its exit
+        # record exists, so the caller is told what happened (and raw shows
+        # the last screen) instead of getting a fresh, unrelated name.
+        if tmux has-session -t "=$existing" 2>/dev/null || \
+           [ -f "${STATE_DIR}/${existing}.exit" ]; then
             echo "$existing"
             return
         fi
@@ -194,6 +255,9 @@ _async_file()    { echo "${STATE_DIR}/${TUI_SESSION}.async"; }
 _poll_hash_file(){ echo "${STATE_DIR}/${TUI_SESSION}.poll-hash"; }
 _last_send_file(){ echo "${STATE_DIR}/${TUI_SESSION}.last-send"; }
 _prompt_file()   { echo "${STATE_DIR}/${TUI_SESSION}.prompt"; }
+# Written by the pane supervisor when the TUI exits on its own (see __run).
+_exit_file()     { echo "${STATE_DIR}/${TUI_SESSION}.exit"; }
+_screen_file()   { echo "${STATE_DIR}/${TUI_SESSION}.screen"; }
 _lock_file() {
     # Lock is keyed on command+directory, NOT session name.
     # This lets _default_session find the right session.
@@ -245,7 +309,10 @@ _start_watchdog() {
             # clean up our own per-session state so it does not leak into /tmp.
             if ! tmux has-session -t "=$session" 2>/dev/null; then
                 rm -f "$stamp" "$async" "$poll_hash" "$watchdog" "$last_send" "$prompt_f"
-                _rm_owned_lock "$session"
+                # If the TUI exited on its own, keep the cmd+dir lock: it is
+                # how a default-session caller still finds the exit record.
+                # start, stop or reap release it later.
+                [ -f "${STATE_DIR}/${session}.exit" ] || _rm_owned_lock "$session"
                 break
             fi
             # Check if stamp file has been updated recently
@@ -316,6 +383,41 @@ _capture() {
     tmux capture-pane -t "=$TUI_SESSION:" -p 2>/dev/null || true
 }
 
+# The session is gone. If its TUI exited on its own, the pane supervisor left
+# an exit record: say so, and say how to read the last screen (stderr, so it
+# is shown even under --quiet). Returns 1 if there is no record.
+_report_exited() {
+    local rec status
+    rec=$(_exit_file)
+    [ -f "$rec" ] || return 1
+    status=$(sed -n 's/^status=//p' "$rec")
+    err "Error: '$TUI_CMD' exited (status ${status:-?}); the session is gone."
+    err "Its last screen was saved. Read it with: tui-driver --session $TUI_SESSION $TUI_CMD raw"
+    err "  (or the file $(_screen_file)). Run 'start' to launch it again."
+    return 0
+}
+
+# True if the session's pane is dead but kept by remain-on-exit. tui-driver's
+# own sessions never have one; a user-made session attached with --session
+# might. Pasting into a dead pane crashes the tmux server (3.2a).
+_pane_dead() {
+    [ "$(tmux display-message -p -t "=$TUI_SESSION:" '#{pane_dead}' 2>/dev/null)" = "1" ]
+}
+
+# Guard for every action that needs a live session.
+_require_session() {
+    if tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
+        if _pane_dead; then
+            err "Error: the TUI in session '$TUI_SESSION' has exited (dead pane kept by remain-on-exit)."
+            err "Its last screen: tui-driver --session $TUI_SESSION $TUI_CMD raw"
+            return 1
+        fi
+        return 0
+    fi
+    _report_exited || err "Error: no session running. Run 'tui-driver $TUI_CMD start' first."
+    return 1
+}
+
 _screen_hash() {
     if command -v md5sum &>/dev/null; then
         _capture | md5sum | cut -d' ' -f1
@@ -352,6 +454,13 @@ _wait_stable() {
     elapsed=$POLL_INTERVAL
 
     while [ "$elapsed" -lt "$timeout" ]; do
+        # The TUI exited (or the session was killed) while we waited:
+        # return 4 so callers report it instead of hashing an empty capture
+        # until the timeout. Checked before _stamp so a dead session's stamp
+        # is not re-created after the watchdog removed it.
+        if ! tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
+            return 4
+        fi
         _stamp
         local cur_hash
         cur_hash=$(_screen_hash)
@@ -392,14 +501,23 @@ _wait_stable() {
 # Stability alone is not completion — a TUI that has not started printing
 # yet (backend call, thinking pause before any output) also yields a stable
 # screen, which used to return an empty response with exit 0. Prints the
-# response; returns 0 when ready, 3 on timeout (printing what is on screen).
+# response; returns 0 when ready, 3 on timeout (printing what is on screen),
+# 1 if the session ended while waiting (the pending query is dropped: there
+# is nothing left to poll).
 _await_response() {
     local prompt="$1"
-    local t0 waited=0 remaining response
+    local t0 waited=0 remaining response rc
     t0=$(date +%s)
     while true; do
         remaining=$((MAX_WAIT - waited))
-        if _wait_stable "$remaining" "$prompt"; then
+        rc=0
+        _wait_stable "$remaining" "$prompt" || rc=$?
+        if [ "$rc" -eq 4 ]; then
+            rm -f "$(_async_file)" "$(_poll_hash_file)"
+            _report_exited || err "Error: the session ended while waiting for the response."
+            return 1
+        fi
+        if [ "$rc" -eq 0 ]; then
             response=$(_extract_response "$prompt")
             if [ -n "$response" ]; then
                 log "Screen stabilised"
@@ -470,6 +588,11 @@ if lines:
 # moment (parallel --session sessions) would race, and one pane could receive
 # the other's prompt. A per-session buffer name makes concurrent sends safe.
 _paste() {
+    # Re-check right before pasting: a dead pane must never receive a paste.
+    if _pane_dead; then
+        err "Error: the TUI's pane is dead; not pasting."
+        return 1
+    fi
     printf '%s' "$1" | tmux load-buffer -b "$TUI_SESSION" -
     tmux paste-buffer -b "$TUI_SESSION" -t "=$TUI_SESSION:" -p -d
 }
@@ -513,15 +636,33 @@ cmd_start() {
         fi
     fi
 
+    # A previous run's exit record is history now.
+    rm -f "$(_exit_file)" "$(_screen_file)"
+
     log "Creating tmux session '$TUI_SESSION' ..."
     tmux new-session -s "$TUI_SESSION" -d -x "$TERM_WIDTH" -y "$TERM_HEIGHT"
-    tmux send-keys -t "=$TUI_SESSION:" "cd $(printf '%q' "$WORK_DIR") && $TUI_CMD" Enter
+    # A user's global "remain-on-exit on" would keep a dead pane around, and
+    # pasting into a dead pane crashes the tmux server (3.2a). Ours close.
+    tmux set-option -w -t "=$TUI_SESSION:" remain-on-exit off 2>/dev/null || true
+    # Replace the pane's interactive shell with the supervisor (see __run).
+    # The shell has already read the user's rc files, so the TUI gets the
+    # same PATH and exported environment as before; shell aliases and
+    # functions are not available (the command must be a real program).
+    local self
+    self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    tmux send-keys -t "=$TUI_SESSION:" "exec $(printf '%q ' "$self" __run "$TUI_SESSION" "$WORK_DIR" "$TUI_CMD")" Enter
 
     # Spawn a watchdog that kills the session if the caller dies.
     _start_watchdog
 
     log "Waiting for $TUI_CMD to start ..."
-    if ! _wait_stable "$START_TIMEOUT"; then
+    local rc=0
+    _wait_stable "$START_TIMEOUT" || rc=$?
+    if [ "$rc" -eq 4 ]; then
+        _report_exited || err "Error: the session ended during startup."
+        return 1
+    fi
+    if [ "$rc" -ne 0 ]; then
         err "Warning: startup timed out after ${START_TIMEOUT}s"
         err "Session left running: inspect with 'raw', or 'stop' then 'start'."
         return 3
@@ -534,10 +675,7 @@ cmd_start() {
 cmd_send() {
     local prompt="${1:?Usage: tui-driver $TUI_CMD send \"your prompt\"}"
 
-    if ! tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
-        err "Error: no session running. Run 'tui-driver $TUI_CMD start' first."
-        return 1
-    fi
+    _require_session || return 1
 
     if [ -f "$(_async_file)" ]; then
         err "Error: async query pending. Poll first: tui-driver $TUI_CMD poll --wait"
@@ -586,10 +724,7 @@ cmd_respond() {
     fi
     local reply="${*:-}"
 
-    if ! tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
-        err "Error: no session running."
-        return 1
-    fi
+    _require_session || return 1
 
     # A blocking respond would fight a pending async query; respond --async
     # is fine (the reply just unblocks the dialog, the query stays pending).
@@ -625,7 +760,13 @@ cmd_respond() {
     # A 1-2 char reply like "y" is not a reliable anchor for
     # _extract_response, so we dump the whole screen and let the caller
     # pick out what they need.
-    if _wait_stable; then
+    local rc=0
+    _wait_stable || rc=$?
+    if [ "$rc" -eq 4 ]; then
+        _report_exited || err "Error: the session ended after the reply."
+        return 1
+    fi
+    if [ "$rc" -eq 0 ]; then
         log "Screen stabilised"
         _capture
         tmux clear-history -t "=$TUI_SESSION:" 2>/dev/null || true
@@ -661,10 +802,7 @@ cmd_respond() {
 cmd_send_async() {
     local prompt="${1:?Usage: tui-driver $TUI_CMD send-async \"your prompt\"}"
 
-    if ! tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
-        err "Error: no session running. Run 'tui-driver $TUI_CMD start' first."
-        return 1
-    fi
+    _require_session || return 1
 
     # Only one async query per session at a time — the caller must poll
     # for the previous response before sending another.
@@ -700,10 +838,7 @@ cmd_poll() {
         wait_mode=true
     fi
 
-    if ! tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
-        err "Error: no session running."
-        return 1
-    fi
+    _require_session || return 1
 
     local async_file poll_hash_file
     async_file=$(_async_file)
@@ -755,6 +890,11 @@ cmd_poll() {
     local prev_hash="" cur_hash stable=0 i
     for (( i=0; i<=STABLE_COUNT; i++ )); do
         [ "$i" -gt 0 ] && sleep "$POLL_INTERVAL"
+        if ! tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
+            rm -f "$async_file" "$poll_hash_file"
+            _report_exited || err "Error: the session ended while the query was pending."
+            return 1
+        fi
         cur_hash=$(_screen_hash)
         _stamp  # each sample is caller-liveness proof for the watchdog
 
@@ -800,7 +940,13 @@ cmd_stop() {
     _stop_watchdog
     if tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
         tmux kill-session -t "=$TUI_SESSION"
+        # Live session: any exit record is stale (kill-session leaves none).
+        rm -f "$(_exit_file)" "$(_screen_file)"
         log "Session stopped"
+    elif [ -f "$(_exit_file)" ]; then
+        # The TUI had already exited: keep its last screen for the caller
+        # (reap clears records older than a day).
+        log "Session had already exited; last screen kept in $(_screen_file)"
     else
         log "No session to stop"
     fi
@@ -809,15 +955,24 @@ cmd_stop() {
 }
 
 cmd_status() {
-    if tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
+    # running | exited (TUI ended on its own; see raw) | stopped
+    if tmux has-session -t "=$TUI_SESSION" 2>/dev/null && ! _pane_dead; then
         echo "running"
+    elif [ -f "$(_exit_file)" ] || _pane_dead; then
+        echo "exited"
     else
         echo "stopped"
     fi
 }
 
 cmd_raw() {
-    _capture
+    if tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
+        _capture
+    elif [ -f "$(_screen_file)" ]; then
+        # The TUI exited: print the screen the pane supervisor saved.
+        err "Session gone: '$TUI_CMD' exited ($(sed -n 's/^status=/status /p' "$(_exit_file)" 2>/dev/null)). Its saved last screen follows."
+        cat "$(_screen_file)"
+    fi
 }
 
 cmd_progress() {
@@ -826,7 +981,13 @@ cmd_progress() {
     # raw it answers the actual question ("is it still working?") without a
     # screen dump. Safe to run at any time, any number of times.
     if ! tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
-        echo "session=stopped"
+        if [ -f "$(_exit_file)" ]; then
+            echo "session=exited"
+            echo "exit_status=$(sed -n 's/^status=//p' "$(_exit_file)")"
+            echo "last_screen=$(_screen_file)"
+        else
+            echo "session=stopped"
+        fi
         return 1
     fi
     echo "session=running"
@@ -939,7 +1100,10 @@ _clear_session_state() {
         rm -f "${STATE_DIR}/${session}.${ext}" \
               "/tmp/.tui-driver-${session}.${ext}"
     done
-    # Drop any cmd+dir lock that still points at this (dead) session.
+    # Drop any cmd+dir lock that still points at this (dead) session --
+    # unless its TUI exited on its own and the exit record is still kept:
+    # the lock is how a default-session caller finds that record.
+    [ -f "${STATE_DIR}/${session}.exit" ] && return 0
     local lf
     shopt -s nullglob
     for lf in "$STATE_DIR"/*.lock /tmp/.tui-driver-*.lock; do
@@ -950,13 +1114,20 @@ _clear_session_state() {
     shopt -u nullglob
 }
 
+_exit_status_of() {
+    sed -n 's/^status=//p' "${STATE_DIR}/${1}.exit" 2>/dev/null
+}
+
 cmd_list() {
-    local any=false session pid idle alive wdstate status
+    local any=false session pid idle alive wdstate status shown=" " rec
     printf '%-30s %-10s %-9s %s\n' "SESSION" "WATCHDOG" "IDLE(s)" "STATUS"
     while IFS=$'\t' read -r session pid idle alive; do
         any=true
+        shown="${shown}${session} "
         if _watchdog_alive "$pid"; then wdstate="alive"; else wdstate="dead"; fi
-        if [ "$alive" = 0 ]; then
+        if [ "$alive" = 0 ] && [ -f "${STATE_DIR}/${session}.exit" ]; then
+            status="EXITED (status $(_exit_status_of "$session")) — 'raw' shows its last screen"
+        elif [ "$alive" = 0 ]; then
             status="dead (leaked state — reap clears it)"
         elif [ "$wdstate" = alive ]; then
             status="managed (live)"
@@ -967,6 +1138,17 @@ cmd_list() {
         fi
         printf '%-30s %-10s %-9s %s\n' "$session" "$pid" "$idle" "$status"
     done < <(_iter_managed_sessions)
+    # Sessions whose TUI exited and whose other state is already cleaned up.
+    shopt -s nullglob
+    for rec in "$STATE_DIR"/*.exit; do
+        session=${rec##*/}; session=${session%.exit}
+        [[ "$shown" == *" $session "* ]] && continue
+        tmux has-session -t "=$session" 2>/dev/null && continue
+        any=true
+        printf '%-30s %-10s %-9s %s\n' "$session" "-" "-" \
+            "EXITED (status $(_exit_status_of "$session")) — 'raw' shows its last screen"
+    done
+    shopt -u nullglob
     if [ "$any" != true ]; then
         echo "(no tui-driver sessions)"
     fi
@@ -999,6 +1181,17 @@ cmd_reap() {
         log "reaped orphan session '$session' (idle ${idle}s, watchdog dead)"
         reaped=$((reaped + 1))
     done < <(_iter_managed_sessions)
+    # Exit records (last screen of a TUI that exited) are kept for a day,
+    # then cleared together with the lock they kept alive.
+    local rec
+    while IFS= read -r rec; do
+        session=${rec##*/}; session=${session%.exit}
+        tmux has-session -t "=$session" 2>/dev/null && continue
+        rm -f "$rec" "${STATE_DIR}/${session}.screen"
+        _clear_session_state "$session"
+        log "cleared day-old exit record of '$session'"
+        reaped=$((reaped + 1))
+    done < <(find "$STATE_DIR" -maxdepth 1 -name '*.exit' -mmin +1440 2>/dev/null)
     log "reap complete: ${reaped} reaped/cleared, ${skipped} skipped"
 }
 
@@ -1040,12 +1233,18 @@ cmd_install() {
     # reports the exact commit it was built from (the install dir is not a
     # repo). Substitute during the copy — BSD/macOS sed has no GNU -i.
     stamp=$(_git_stamp "$srcdir" 2>/dev/null) || stamp=""
+    # Write a new file and rename it over the old one, never overwrite in
+    # place: bash reads scripts lazily, so a running tui-driver (a pane
+    # supervisor, a long poll --wait) would read the new bytes at its old
+    # offset. A rename leaves running copies on the old inode.
+    local tmp="${dst}.tmp.$$"
     if [ -n "$stamp" ]; then
-        sed "s/^BUILD_STAMP=\"\"/BUILD_STAMP=\"${stamp}\"/" "$src" > "$dst"
+        sed "s/^BUILD_STAMP=\"\"/BUILD_STAMP=\"${stamp}\"/" "$src" > "$tmp"
     else
-        cp "$src" "$dst"
+        cp "$src" "$tmp"
     fi
-    chmod +x "$dst"
+    chmod +x "$tmp"
+    mv -f "$tmp" "$dst"
     log "Installed to $dst${stamp:+ (${stamp})}"
     if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
         log "WARNING: ${INSTALL_DIR} is not in your PATH."
