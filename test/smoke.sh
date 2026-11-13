@@ -24,7 +24,7 @@ check() { # check <description> <condition...>
 
 cleanup() {
     local s
-    for s in pong delay spin dialog until pfx10 pfx1 miss once norm; do
+    for s in pong delay spin dialog until pfx10 pfx1 miss once norm menu; do
         $TD -q --session "${RUN_ID}-${s}" true stop >/dev/null 2>&1 || true
     done
     $TD -q --dir "$TMPDIR_T/dflt" "$TMPDIR_T/pong-tui.sh" stop >/dev/null 2>&1 || true
@@ -56,6 +56,16 @@ echo "Approve fetch? [y/n]"
 read -r a
 sleep 1
 echo "final-answer-42"
+read -r _
+EOF
+cat > "$TMPDIR_T/menu-tui.sh" <<'EOF'
+#!/usr/bin/env bash
+# A menu that acts on a single keypress, like claude/agy approvals.
+read -r q
+echo "Proceed? 1. Yes  4. No"
+read -rsn1 k
+case "$k" in 1) echo "menu-approved";; 4) echo "menu-denied";; *) echo "menu-other";; esac
+read -r rest; echo "line-after-menu:${rest}"
 read -r _
 EOF
 cat > "$TMPDIR_T/once-tui.sh" <<'EOF'
@@ -199,7 +209,26 @@ sleep 1
 check "normal stop leaves no exit record"       [ ! -e "$STATE_DIR/${S}.exit" ]
 rm -f "$STATE_DIR/${RUN_ID}"-*.exit "$STATE_DIR/${RUN_ID}"-*.screen
 
-# 12. stop cleans state; shellcheck -------------------------------------------
+# 12. respond --key: single keypress, no Enter ---------------------------------
+S="${RUN_ID}-menu"
+MENU="$TMPDIR_T/menu-tui.sh"
+$TD -q --session "$S" "$MENU" start >/dev/null 2>&1
+$TD -q --session "$S" "$MENU" send-async "deploy" >/dev/null 2>&1
+sleep 4
+$TD -q --session "$S" "$MENU" poll >/dev/null 2>&1
+$TD -q --session "$S" "$MENU" respond --async --key 4 >/dev/null 2>&1; rc=$?
+check "respond --async --key exits 0"           [ "$rc" -eq 0 ]
+sleep 2
+out=$($TD -q --session "$S" "$MENU" raw 2>/dev/null)
+check "  key reached the menu (denied)"         grep -q "menu-denied" <<<"$out"
+check "  no Enter was sent after the key"       bash -c "! grep -q 'line-after-menu' <<<\"\$1\"" _ "$out"
+$TD -q --session "$S" "$MENU" cancel >/dev/null 2>&1
+$TD -q --session "$S" "$MENU" respond "typed-reply" >/dev/null 2>&1
+out=$($TD -q --session "$S" "$MENU" raw 2>/dev/null)
+check "respond types the reply + Enter"         grep -q "line-after-menu:typed-reply" <<<"$out"
+$TD -q --session "$S" "$MENU" stop >/dev/null 2>&1
+
+# 13. stop cleans state; shellcheck -------------------------------------------
 check "no state files left for this run"        bash -c "! ls '$STATE_DIR'/${RUN_ID}-* >/dev/null 2>&1"
 if command -v shellcheck >/dev/null 2>&1; then
     check "shellcheck clean"                    shellcheck -S style "$TD"

@@ -717,12 +717,21 @@ cmd_respond() {
     # --async: return immediately and (re-)arm the pending-async record using
     # the original prompt as anchor, so a follow-up poll / poll --wait picks
     # up the response — the dialog flow for async queries.
-    local async_mode=false
-    if [ "${1:-}" = "--async" ]; then
-        async_mode=true
-        shift
-    fi
+    # --key K [K...]: send tmux key names (4, Escape, Down, C-c, ...) and NO
+    # Enter. For menus that act on a single keypress.
+    local async_mode=false key_mode=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --async) async_mode=true; shift ;;
+            --key)   key_mode=true; shift ;;
+            *) break ;;
+        esac
+    done
     local reply="${*:-}"
+    if [ "$key_mode" = true ] && [ $# -eq 0 ]; then
+        err "Usage: tui-driver $TUI_CMD respond [--async] --key KEY [KEY...]"
+        return 1
+    fi
 
     _require_session || return 1
 
@@ -733,11 +742,27 @@ cmd_respond() {
         return 1
     fi
 
-    if [ -n "$reply" ]; then
-        _paste "$reply"
-        sleep 0.3
+    # Replies are TYPED (send-keys -l), not pasted. Menus in `claude` and
+    # `agy` ignore bracketed-paste input entirely, so a pasted "n" (or "4")
+    # did nothing and the Enter after it accepted the highlighted default:
+    # "deny" approved the command. Typed keys reach the menu.
+    if _pane_dead; then
+        err "Error: the TUI's pane is dead; not sending keys."
+        return 1
     fi
-    tmux send-keys -t "=$TUI_SESSION:" Enter
+    if [ "$key_mode" = true ]; then
+        # Key names, no Enter: a menu acts on the keypress itself, and an
+        # extra Enter would land on whatever comes next (with two tool calls
+        # issued at once, `claude` shows the second approval immediately and
+        # that Enter approved it unseen).
+        tmux send-keys -t "=$TUI_SESSION:" "$@"
+    else
+        if [ -n "$reply" ]; then
+            tmux send-keys -t "=$TUI_SESSION:" -l -- "$reply"
+            sleep 0.3
+        fi
+        tmux send-keys -t "=$TUI_SESSION:" Enter
+    fi
 
     if [ "$async_mode" = true ]; then
         local prompt_file
@@ -1293,10 +1318,16 @@ Actions:
   send-async "p"    Send prompt and return immediately (non-blocking)
   poll              Check if send-async response is ready (single check)
   poll --wait       Block until send-async response is ready
-  respond "reply"   Reply to an approval/dialog, "" = just press Enter
-                    (blocking: prints the resulting screen itself)
-  respond --async "reply"
-                    Reply and return immediately, re-arming the pending
+  respond "reply"   Type a reply + Enter (line prompts, e.g. [y/n]);
+                    "" = just press Enter. Blocking: prints the screen
+  respond --key K [K...]
+                    Send key(s) with NO Enter: tmux key names such as 4,
+                    Escape, Down, C-c. Use this for numbered menus
+                    (claude/agy approvals: --key 1 = yes, the "No" number
+                    or Escape = deny); an extra Enter could approve the
+                    NEXT dialog unseen
+  respond --async [--key] ...
+                    Same, but return immediately, re-arming the pending
                     query so poll / poll --wait retrieves the response
   cancel            Drop a pending async query (session keeps running)
   stop              Kill the session
