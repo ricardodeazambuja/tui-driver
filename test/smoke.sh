@@ -245,8 +245,9 @@ $TD -q --session "$S" "$MENU" start >/dev/null 2>&1
 $TD -q --session "$S" "$MENU" send-async "deploy" >/dev/null 2>&1
 sleep 4
 $TD -q --session "$S" "$MENU" poll >/dev/null 2>&1
-$TD -q --session "$S" "$MENU" respond --async --key 4 >/dev/null 2>&1; rc=$?
-check "respond --async --key exits 0"           [ "$rc" -eq 0 ]
+$TD -q --session "$S" "$MENU" respond --key 4 --async >/dev/null 2>&1; rc=$?
+check "respond --key 4 --async exits 0"         [ "$rc" -eq 0 ]
+check "  --async after the key re-armed poll"   [ -e "$STATE_DIR/${S}.async" ]
 sleep 2
 out=$($TD -q --session "$S" "$MENU" raw 2>/dev/null)
 check "  key reached the menu (denied)"         grep -q "menu-denied" <<<"$out"

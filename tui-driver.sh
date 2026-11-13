@@ -748,9 +748,18 @@ cmd_respond() {
         esac
     done
     local reply="${*:-}"
-    if [ "$key_mode" = true ] && [ $# -eq 0 ]; then
-        err "Usage: tui-driver $TUI_CMD respond [--async] --key KEY [KEY...]"
-        return 1
+    # In key mode every argument is a key name, so --async may also come
+    # after them ("--key 4 --async"); it is a flag, never a key.
+    local keys=() a
+    if [ "$key_mode" = true ]; then
+        for a in "$@"; do
+            if [ "$a" = "--async" ]; then async_mode=true; else keys+=("$a"); fi
+        done
+        if [ "${#keys[@]}" -eq 0 ]; then
+            err "Usage: tui-driver $TUI_CMD respond [--async] --key KEY [KEY...]"
+            return 1
+        fi
+        reply="${keys[*]}"
     fi
 
     _require_session || return 1
@@ -775,7 +784,7 @@ cmd_respond() {
         # extra Enter would land on whatever comes next (with two tool calls
         # issued at once, `claude` shows the second approval immediately and
         # that Enter approved it unseen).
-        tmux send-keys -t "=$TUI_SESSION:" "$@"
+        tmux send-keys -t "=$TUI_SESSION:" -- "${keys[@]}"
     else
         if [ -n "$reply" ]; then
             tmux send-keys -t "=$TUI_SESSION:" -l -- "$reply"
