@@ -125,30 +125,44 @@ tui-driver claude stop
 
 ### Replying to confirmation dialogs
 
-Some TUIs ask follow-up questions (e.g. "Apply changes? [y/n]"). Use
-`respond` for these:
+There are two kinds of dialog, and they need different replies.
+
+**Line prompts** (e.g. "Apply changes? [y/n]" read as a line): `respond`
+types the reply and presses Enter.
 
 ```bash
 tui-driver aichat send "Refactor this function"
 tui-driver aichat respond "y"
+tui-driver aichat respond ""      # just press Enter
 ```
 
-Pass an empty string to just press Enter:
+**Menus that act on a keypress** (the tool-approval menus of `claude` and
+`agy`: "1. Yes … 4. No"): use `respond --key`, which sends tmux key names
+and **no Enter**:
 
 ```bash
-tui-driver aichat respond ""
+tui-driver claude respond --key 1        # approve (option 1)
+tui-driver claude respond --key Escape   # deny / cancel
+tui-driver agy respond --key 4           # agy: "4. No, cancel"
 ```
 
+Why it matters: these menus ignore pasted text, and an Enter after a
+keypress lands on whatever appears next. When a model issues two tool calls
+at once, `claude` shows the second approval immediately, so a reply with an
+Enter after it would approve that second call unseen. (Before 0.4.0,
+`respond "n"` pasted the "n" and pressed Enter, which **approved** the
+command.) Read the menu first and pick the number it shows.
+
 `respond` blocks and prints the resulting screen itself. When the dialog
-interrupted an **async** query, use `respond --async` instead: it replies,
-returns immediately, and re-arms the pending query so a follow-up
-`poll` / `poll --wait` retrieves the real response:
+interrupted an **async** query, add `--async`: it replies, returns
+immediately, and re-arms the pending query so a follow-up `poll` /
+`poll --wait` retrieves the real response:
 
 ```bash
 tui-driver agy send-async "Fetch https://example.com and summarise"
-tui-driver agy poll            # → returns the approval dialog text
-tui-driver agy respond --async "y"
-tui-driver agy poll --wait     # → the actual response
+tui-driver agy poll                      # → returns the approval dialog text
+tui-driver agy respond --async --key 1   # approve
+tui-driver agy poll --wait               # → the actual response
 ```
 
 ### Working directory
@@ -157,14 +171,28 @@ Tell the TUI which directory to start in:
 
 ```bash
 tui-driver --dir /path/to/project agy start
-tui-driver agy send "Explain the code in main.py"
+tui-driver --dir /path/to/project agy send "Explain the code in main.py"
+tui-driver --dir /path/to/project agy stop
 ```
+
+Pass the same `--dir` on **every** call (or run every call from that
+directory): a default session is found by command + directory, and the
+directory defaults to the current one, so a `send` without `--dir` looks
+for a different session. With `--session NAME` the directory only matters
+for `start`.
 
 Or via environment variable:
 
 ```bash
-TUI_DIR=/path/to/project tui-driver agy start
+export TUI_DIR=/path/to/project
+tui-driver agy start
+tui-driver agy send "Explain the code in main.py"
 ```
+
+The command must be a real program on your `PATH` (or a path to one), not
+a shell alias or function: the pane's shell is replaced by tui-driver's
+supervisor before the command runs. To pass flags, put them in a small
+wrapper script (see the `agy-web` example under Bundled skills).
 
 ### Attaching to an existing tmux session
 
@@ -192,6 +220,9 @@ Notes:
   label; the actual process is whatever you launched in the tmux session.
 - `stop` will kill the session you attached to, so use plain `tmux kill-session
   -t mysession` (or just detach) if you want to keep it alive.
+- If that session keeps dead panes (`remain-on-exit on`), tui-driver will not
+  paste into one: on tmux 3.2a pasting into a dead pane crashes the tmux server
+  and every session on it. Sessions started by tui-driver force it off.
 
 ### Multiple agents in parallel (same command, same directory)
 
@@ -219,6 +250,9 @@ tui-driver --session agent2 agy stop
 ```
 
 Each named session keeps its own state and watchdog; they never collide.
+Names may use only letters, digits, `_` and `-` (tmux rewrites `.` and `:`),
+and are matched exactly: `--session p1` never touches a session called `p10`
+(before 0.4.0 it did, by tmux prefix matching).
 
 > **Requires 0.3.1 or newer.** Up to 0.3.0 every send pasted through tmux's
 > *unnamed* buffer, which is a server-wide stack. Two sessions sending at the
@@ -243,6 +277,34 @@ tui-driver reap   # kill true orphans and clear any leaked state files
 kills a session when its watchdog process is **dead** *and* it has been idle
 longer than `TUI_WATCHDOG`. A live agent always has a live watchdog, so it is
 never touched — anything skipped is logged.
+
+### When the TUI exits or crashes
+
+If the TUI ends on its own — a clean `/exit` or `/quit`, a crash, a
+`kill -9`, a command that was never found — tui-driver keeps its **last
+screen** (scrollback included) and its exit status, and the session ends.
+Nothing is left behind to read a prompt. Before 0.4.0 the pane fell back to
+a shell and the next `send` **ran the prompt as a shell command**.
+
+Every later call says so, on stderr even with `-q`, and exits 1:
+
+```
+$ tui-driver claude send "hello"
+[tui-driver:tui-claude-123] Error: 'claude' exited (status 137); the session is gone.
+[tui-driver:tui-claude-123] Its last screen was saved. Read it with: tui-driver --session tui-claude-123 claude raw
+[tui-driver:tui-claude-123]   (or the file /run/user/1000/tui-driver/tui-claude-123.screen). Run 'start' to launch it again.
+```
+
+- `status` prints `exited`; `progress` prints `session=exited`,
+  `exit_status=N` and `last_screen=FILE`; `list` shows `EXITED`.
+- `raw` prints the saved screen. A blocking `send` / `poll --wait` that was
+  waiting returns 1 the same way and drops the pending query.
+- What the screen holds depends on the TUI: after `kill -9` or a crash it
+  is the TUI's last UI; on a clean `/exit`, `claude` clears its UI and leaves
+  a `claude --resume <id>` line, which is saved.
+- The record (`<session>.exit` and `.screen` in the state dir) is kept after
+  `stop`, replaced by the next `start` of the same session, and cleared by
+  `reap` after a day. A `stop` of a live session leaves none.
 
 ### Quiet mode (for AI agents)
 
@@ -358,7 +420,7 @@ tui-driver agy raw
 Check whether a session is running:
 
 ```bash
-tui-driver agy status   # prints "running" or "stopped"
+tui-driver agy status   # prints "running", "exited" or "stopped"
 ```
 
 ## Bundled skills (for Claude Code)
@@ -375,7 +437,7 @@ skills that drive a TUI through `tui-driver`. Drop one into your project's (or
   launches the bare command token and can't forward flags to it:
 
   ```bash
-  printf '#!/usr/bin/env bash\nexec agy --model gemini-3.6-flash-high --effort high "$@"\n' \
+  printf '#!/usr/bin/env bash\nexec agy --model gemini-3.8-flash-high --effort high "$@"\n' \
       > ~/.local/bin/agy-web && chmod +x ~/.local/bin/agy-web
   ```
 - **`claude-delegate`** — hand a self-contained task to an *independent*
@@ -399,7 +461,11 @@ pending), but the turn is wasted.
 choice: it parses the Bash command, and if it is a tui-driver invocation using a
 blocking action (`send`, `respond` without `--async`, or `poll --wait`) that is
 not already backgrounded, it rewrites the tool input to set
-`run_in_background: true`. Non-blocking actions, other people's commands, and
+`run_in_background: true`. It grants no permission: Claude Code applies the
+rewritten input and then runs its normal permission flow (your rules, your
+prompt) on it, exactly as if the hook were absent. (Before 0.4.0 it answered
+"allow", which also approved anything chained after the tui-driver call.)
+Non-blocking actions, other people's commands, and
 prompts that merely contain the word "send" are left alone — `hooks/test-hook.sh`
 covers those cases.
 
@@ -434,20 +500,21 @@ Hooks are snapshotted at startup, so restart Claude Code afterwards.
 | `poll` | Self-contained stability probe (~`TUI_STABLE`×`TUI_POLL`s): returns the full response if ready, else `waiting` | Brief | 0 = ready, 2 = still changing |
 | `poll --wait` | Block until async response is ready | Yes | 0 = ready, 3 = timeout (query stays pending) |
 | `progress` | Read-only check on a pending query: pending?, elapsed, screen changing?, last lines. Never consumes anything | ~1s | 0, 1 = no session |
-| `respond "reply"` | Send a short reply (e.g. `y`, `n`, `""`), print resulting screen | Yes | 0 = stable, 3 = timeout |
-| `respond --async "reply"` | Reply and re-arm the pending query for `poll` | No | 0 = sent, 1 = error |
+| `respond "reply"` | Type a short reply + Enter (line prompts; `""` = just Enter), print resulting screen | Yes | 0 = stable, 3 = timeout |
+| `respond --key K [K...]` | Send tmux key names (`1`, `4`, `Escape`, `Down`, `C-c`, ...) with **no** Enter — for menus that act on a keypress | Yes | 0 = stable, 3 = timeout |
+| `respond --async [--key] ...` | Same reply, return at once and re-arm the pending query for `poll` | No | 0 = sent, 1 = error |
 | `cancel` | Drop a pending async query (session keeps running) | No | 0 |
 | `stop` | Kill session and clean up | No | 0 |
-| `status` | Print `running` or `stopped` | No | 0 |
-| `raw` | Dump raw screen content | No | 0 |
+| `status` | Print `running`, `exited` (the TUI ended on its own; see `raw`) or `stopped` | No | 0 |
+| `raw` | Dump raw screen content; after the TUI exited, its saved last screen | No | 0 |
 | `list` | List all tui-driver sessions (any dir/command) and their status | No | 0 |
 | `reap` | Kill orphaned sessions and clear leaked state (see below) | No | 0 |
 | `install` | Copy to `~/.local/bin` | No | 0 |
 | `uninstall` | Remove from `~/.local/bin` | No | 0 |
 | `version` | Print the tui-driver version (includes a git build stamp when run from a checkout) | No | 0 |
 
-Exit code 1 always means a hard error (no session, no pending async, bad
-usage) and is explained on stderr — even under `--quiet`. Code 2 means
+Exit code 1 always means a hard error (no session, the TUI exited, no
+pending async, bad usage) and is explained on stderr — even under `--quiet`. Code 2 means
 "not ready yet, ask again"; code 3 means "timed out" (for `send`/`poll
 --wait` the query stays pending and can still be retrieved).
 
@@ -505,6 +572,11 @@ recursion?"`, the tool:
 Your prompt is the delimiter. No regex. No profiles. This works with any
 TUI that echoes input -- which is virtually all of them.
 
+A multi-line prompt is echoed line by line, so after the anchor the
+response also skips past the echo of the prompt's last line. If the prompt
+is not on screen at all (a dialog took it — e.g. a startup trust prompt),
+the whole screen is returned and a warning is printed on stderr.
+
 ### Screen stabilisation, not parsing
 
 How do you know the TUI is done responding? You don't parse its output.
@@ -527,6 +599,28 @@ yet (backend call, thinking pause) also has a stable screen, and returning
 early there is how partial/empty answers happen. And when even that is not
 enough — screens that never settle, long mid-response pauses — `--until`
 (above) replaces the heuristic with an exact completion marker.
+
+### Exact tmux targets
+
+tmux resolves `-t NAME` by exact name, then by prefix, then by glob. Every
+tmux call in tui-driver therefore uses `=NAME` (session) or `=NAME:` (pane),
+which only ever matches exactly. Without it, with `p10` running, a call for
+`p1` was answered by `p10` and `stop` killed it.
+
+### The pane supervisor
+
+`start` does not type the TUI command into the pane's shell. It types
+`exec tui-driver __run SESSION DIR CMD`: the shell (which has already read
+your rc files, so `PATH` and exported variables are as usual) is replaced by
+a few lines of tui-driver that run the TUI as their child. When the TUI
+exits on its own, they save the pane and the exit status and exit, which
+closes the session. This is what guarantees that a prompt is never read by
+a shell, and what keeps the last screen (see "When the TUI exits or
+crashes").
+
+tmux's `remain-on-exit` (keep the dead pane readable) looks simpler and was
+rejected: on tmux 3.2a, `paste-buffer` into a dead pane crashes the tmux
+server, and a paste racing the TUI's exit cannot be ruled out.
 
 ### One tmux paste buffer per session
 
@@ -563,7 +657,8 @@ The raw capture is always available via `raw`.
 ### Random session names
 
 Session names look like `tui-agy-1038314688` instead of a
-predictable `tui-agy`. This avoids accidental collisions when
+predictable `tui-agy` (characters tmux would rewrite — `.`, `:`, `/`,
+spaces — become `_`, so `./my.sh` gets `tui-__my_sh-…`). This avoids accidental collisions when
 multiple callers share the same TUI command, and makes it harder for
 unrelated processes to stumble onto the wrong session.
 
@@ -707,7 +802,9 @@ tui-driver agy stop
 ## Testing
 
 The repo ships a self-contained smoke test that exercises the full
-lifecycle (start/send/async/poll/dialog/`--until`/timeout/cleanup)
+lifecycle (start/send/async/poll/dialog/`--until`/timeout/cleanup, plus
+exact session names, TUI exit and crash handling, keypress menus and
+multi-line prompts)
 against tiny synthetic TUIs — no AI CLI needed, just tmux and python3:
 
 ```bash

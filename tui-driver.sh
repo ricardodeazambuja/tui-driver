@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-VERSION="0.3.1"
+VERSION="0.4.0"
 # Baked in at install time by cmd_install (git short hash, +-dirty if the
 # source tree had uncommitted changes). Empty when running straight from a
 # checkout, in which case _build_stamp falls back to live git.
@@ -1377,8 +1377,9 @@ Actions:
                     query so poll / poll --wait retrieves the response
   cancel            Drop a pending async query (session keeps running)
   stop              Kill the session
-  status            Print running / stopped
-  raw               Raw screen capture (for debugging)
+  status            Print running / exited / stopped
+  raw               Raw screen capture (for debugging); after the TUI
+                    exited, its saved last screen
   progress          Read-only check on a pending query: pending?, elapsed,
                     screen still changing?, last screen lines. Never
                     consumes the response — safe to run any time
@@ -1458,7 +1459,8 @@ How poll works (read this before driving from an agent):
     TUI_TIMEOUT, or run 'cancel' to drop it.
   * If a query stalls on an approval dialog, a plain `poll` returns the
     dialog text (and clears the pending record); reply with
-    `respond --async "y"` and then poll again for the real response.
+    `respond --async "y"` (line prompt) or `respond --async --key 1`
+    (claude/agy menu) and then poll again for the real response.
   * To check on a pending query WITHOUT retrieving it, use `progress`
     (safe, read-only). Do NOT use `raw` for that — it dumps the screen
     without answering "is it still working?". Use poll/poll --wait to

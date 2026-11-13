@@ -57,8 +57,12 @@ each one when done so it isn't left running.
 # Start an independent claude session in the current directory
 tui-driver claude start
 
-# ...or in a specific directory (the sub-Claude's working dir)
+# ...or in a specific directory (the sub-Claude's working dir). Pass the SAME
+# --dir on every later call too (send-async, poll, respond, stop): the default
+# session is found by command + directory, and the directory defaults to the
+# current one. Or use --session NAME, which needs --dir only on start.
 tui-driver --dir /path/to/project claude start
+tui-driver --dir /path/to/project claude send-async "..."
 
 # When fully done, stop it (do not leave it running — it costs)
 tui-driver claude stop
@@ -69,8 +73,10 @@ a trust/onboarding dialog ("Do you trust the files in this folder?"). After
 `start`, peek once and clear it if present:
 
 ```bash
-tui-driver claude raw          # one look: is a trust/onboarding dialog showing?
-tui-driver claude respond ""   # press Enter to accept the default, if so
+tui-driver claude raw              # one look: is a trust/onboarding dialog showing?
+tui-driver claude respond --key 1  # if so, pick "1. Yes, I trust this folder"
+
+Read the dialog before answering; pick the option number it shows.
 ```
 
 **Parallel / multiple delegates.** The default session is keyed on
@@ -92,6 +98,13 @@ tui-driver claude stop && tui-driver claude start   # force a clean restart
 ```
 
 `reap` never touches a live or recently-active session.
+
+**If the sub-Claude exits** (it crashed, was killed, or ran `/exit`), every call
+exits 1 with "'claude' exited (status N)" on stderr. `tui-driver claude raw`
+prints its saved last screen; after a clean exit that includes a
+`claude --resume <id>` line. `start` launches a fresh session.
+
+Requires tui-driver ≥ 0.4.0 (`tui-driver --version`).
 
 ## Delegating a Task (Async Pattern)
 
@@ -149,14 +162,21 @@ of your own prompt can't match the pattern.)
 
 A driven `claude` will pause on tool-permission dialogs (edit a file, run a
 command, etc.). Your `poll` will return with the dialog text on screen instead
-of a final answer. Read it, decide, and reply with `respond --async`, which
-re-arms the pending task so the next `poll --wait` picks up where it left off:
+of a final answer. It is a numbered menu (`1. Yes`, `2. Yes, and always
+allow …`, …, `4. No`). Read it, decide, and reply with `respond --async --key N`,
+which presses that one key (no Enter) and re-arms the pending task so the next
+`poll --wait` picks up where it left off:
 
 ```bash
-tui-driver claude respond --async "y"     # approve the pending tool use
-tui-driver claude respond --async "n"     # deny
-tui-driver claude respond --async ""      # press Enter (accept the highlighted default)
+tui-driver claude respond --async --key 1        # approve this one tool use
+tui-driver claude respond --async --key Escape   # deny (or the "No" number shown)
 ```
+
+Do **not** answer with `"y"`/`"n"` text or a bare Enter. The menu ignores the
+text, and the Enter accepts the highlighted default, which is "Yes". Worse, when
+the sub-Claude issues two tool calls at once, the second approval appears
+immediately and a stray Enter approves it unseen. Answer each dialog with
+`--key`, then poll again; the next dialog, if any, comes back the same way.
 
 After responding, start a new `poll --wait` (in the background) to get the
 next state or the final result.
@@ -210,5 +230,6 @@ self-contained.
    short) and prefer an `--until` completion marker.
 7. **Self-contained prompts** — the sub-Claude has none of your context.
 8. **Prefer file output** (`write … to /tmp/…`) and read it back to verify.
-9. **Inspect permission dialogs** before `respond`-ing; don't auto-approve.
+9. **Inspect permission dialogs** before responding, answer with
+   `respond --async --key N` (never `"y"`/`"n"`), and don't auto-approve.
 10. **`stop` when done** — never leave a sub-Claude running.

@@ -71,25 +71,33 @@ hand, on any machine where this skill runs:
 ```bash
 cat > ~/.local/bin/agy-web <<'EOF'
 #!/usr/bin/env bash
-exec agy --model gemini-3.6-flash-high --effort high "$@"
+exec agy --model gemini-3.8-flash-high --effort high "$@"
 EOF
 chmod +x ~/.local/bin/agy-web
 ```
 
 Adjust the model id to taste — `agy models` lists what is available (the effort level is
-baked into the id, e.g. `gemini-3.6-flash-{high,medium,low}`); an invalid id makes `agy`
-print the valid list and refuse, so a typo fails loudly rather than silently downgrading.
+baked into the id, e.g. `gemini-3.8-flash-{high,medium,low}`). **An id that no longer
+exists does NOT fail loudly:** `agy` shows a warning inside the TUI and silently runs
+another model (seen in 2026-11, when `gemini-3.6-flash-high` was retired and sessions ran
+"Orchestrator (Argon)" instead). After changing the wrapper, start a session and check the
+model named in the banner and status bar.
 
 **Why a wrapper instead of a flag or a config file:** `tui-driver <cmd> start` launches
-the bare command token and cannot forward flags to it, and putting them inside the token
-would corrupt the tmux session and lock-file names, which interpolate it. The CLI's own
+the command token as given; a token with spaces and flags in it does not work well with
+tui-driver's session names or its background hook. The CLI's own
 persistent default (`~/.gemini/antigravity-cli/settings.json`) is global and gets silently
 rewritten by any in-TUI `/model` switch, so it cannot be relied on either. Pinning at
 launch is the only thing that guarantees the model. To confirm which model a live session
 actually got, `tmux capture-pane -p -t <session>` — the status bar shows it.
 
-If `agy-web` is missing, `tui-driver agy-web start` fails with a command-not-found in the
-tmux pane. Create the wrapper; do NOT fall back to bare `agy`.
+If `agy-web` is missing, `tui-driver agy-web start` exits 1 with "'agy-web' exited
+(status 127)"; `raw` shows the command-not-found. Create the wrapper; do NOT fall back to
+bare `agy`.
+
+**If the session dies** (agy crashed, was killed, or quit), every call exits 1 with
+"'agy-web' exited (status N)" on stderr. `tui-driver agy-web raw` prints its saved last
+screen; `start` launches a fresh session.
 
 ## Session Management
 
@@ -212,14 +220,16 @@ Three parallel lookups cost about what one costs. Rules:
   each is a full Antigravity process. The 600 s idle watchdog is a backstop, not
   a plan.
 - Keep it to ~3 concurrent sessions. More buys little and costs memory.
-- Needs tui-driver ≥ 0.3.1. Earlier versions pasted through tmux's *unnamed*
-  buffer, which is shared process-wide: parallel sends raced and a session could
-  receive another session's prompt — silently, with a plausible answer to the
-  wrong question. Check with `tui-driver --version`.
+- Needs tui-driver ≥ 0.4.0 (check with `tui-driver --version`). Before 0.3.1, sends
+  pasted through tmux's *unnamed* buffer, which is shared process-wide: parallel sends
+  raced and a session could receive another session's prompt — silently, with a
+  plausible answer to the wrong question. Before 0.4.0, session names were matched by
+  prefix (`web1` could reach `web10`), and approvals needed `--key` to work at all.
 
 ### Where the wall-clock actually goes
 
-Measured on this machine (Gemini 3.6 Flash, high effort):
+Measured on this machine (Gemini 3.6 Flash, high effort — since retired; the current
+Flash should be in the same range, but it has not been re-measured):
 
 | Step | Cost |
 |------|------|
@@ -303,16 +313,21 @@ tui-driver agy-web send-async "Read https://example.com/connector-spec.pdf and e
 
 ## Handling Approvals
 
-If Antigravity needs approval for a tool (e.g., to fetch a URL), `send-async` will
-return the approval dialog on the next `poll`. Read it, decide, and reply
-with `respond --async`, which re-arms the pending query so the next
-`poll` / `poll --wait` retrieves the real response:
+If Antigravity needs approval for a tool (e.g., to run a command or fetch a URL),
+`send-async` will return the approval dialog on the next `poll`. It is a numbered menu
+(`1. Yes, run command` … `4. No, cancel`). Read it, decide, and reply with
+`respond --async --key N`, which presses that one key (no Enter) and re-arms the pending
+query so the next `poll` / `poll --wait` retrieves the real response:
 
 ```bash
-tui-driver agy-web respond --async "y"     # approve
-tui-driver agy-web respond --async "n"     # deny
-tui-driver agy-web respond --async ""      # press Enter (accept default)
+tui-driver agy-web respond --async --key 1        # approve once
+tui-driver agy-web respond --async --key 4        # deny ("4. No, cancel")
+tui-driver agy-web respond --async --key Escape   # cancel
 ```
+
+Use the numbers the menu actually shows. Do **not** reply with `"y"`/`"n"` text: the menu
+ignores it, and the Enter that follows a text reply accepts the highlighted default —
+which is "Yes". (Before tui-driver 0.4.0, `respond "n"` approved the command.)
 
 After responding, run `poll --wait` (in the background) to get the actual
 response. (Plain `respond` without `--async` blocks and prints the resulting
@@ -373,4 +388,4 @@ the value as unverified and let the user decide — do not quietly use it anyway
     and trust the completion notification. Do not re-poll to "check". If you genuinely
     suspect a stall, `tui-driver agy-web progress` is read-only and safe — never `raw`.
 11. **Verify before you use, always** — the output is a suggestion, not truth. Ask Antigravity to save raw output to a file (e.g. `/tmp/result.md`), read it yourself, and confirm against the primary source — testably where a test is possible. If you can't verify it, label it unverified and don't build on it. See the READ FIRST section at the top.
-12. **Never use plain `agy`** — the command token is `agy-web`, a wrapper that pins the model to Gemini 3.6 Flash at high reasoning effort (see Prerequisites above; create it if missing). Bare `agy` follows a mutable global default that any in-TUI `/model` switch silently changes.
+12. **Never use plain `agy`** — the command token is `agy-web`, a wrapper that pins the model to Gemini 3.8 Flash at high reasoning effort (see Prerequisites above; create it if missing). Bare `agy` follows a mutable global default that any in-TUI `/model` switch silently changes.
