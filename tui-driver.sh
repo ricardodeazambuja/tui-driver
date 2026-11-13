@@ -930,12 +930,29 @@ cmd_poll() {
         fi
         prev_hash="$cur_hash"
 
-        if [ "$stable" -ge "$STABLE_COUNT" ]; then
-            log "Screen stable"
-            _extract_response "$prompt"
-            tmux clear-history -t "=$TUI_SESSION:" 2>/dev/null || true
-            rm -f "$async_file" "$poll_hash_file"
-            return 0
+        # Same completion rules as send / poll --wait (_wait_stable +
+        # _await_response): the --until marker wins at once; otherwise the
+        # screen must be stable AND the response non-empty. A stable but
+        # empty screen is a TUI that has not started answering yet, so it is
+        # "waiting", not an empty answer (which also cleared the query).
+        local done_now=false
+        if [ -n "$DONE_PATTERN" ] && \
+           _extract_response "$prompt" | grep -E "$DONE_PATTERN" >/dev/null; then
+            done_now=true
+        elif [ "$stable" -ge "$STABLE_COUNT" ]; then
+            done_now=true
+        fi
+        if [ "$done_now" = true ]; then
+            local response
+            response=$(_extract_response "$prompt")
+            if [ -n "$response" ]; then
+                log "Screen stable"
+                printf '%s\n' "$response"
+                tmux clear-history -t "=$TUI_SESSION:" 2>/dev/null || true
+                rm -f "$async_file" "$poll_hash_file"
+                return 0
+            fi
+            break
         fi
     done
 

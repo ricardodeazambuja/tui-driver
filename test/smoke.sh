@@ -96,7 +96,7 @@ t1=$(date +%s)
 check "send exits 0"                            [ "$rc" -eq 0 ]
 check "send under 9s (throttle-skip)"           [ $((t1 - t0)) -lt 9 ]
 check "response captured"                       grep -q "pong-response" <<<"$out"
-check "state files in STATE_DIR"                ls "$STATE_DIR/${S}.stamp" >/dev/null 2>&1
+check "state files in STATE_DIR"                [ -e "$STATE_DIR/${S}.stamp" ]
 
 # 3. Async: poll retrieves and clears; second poll errors ----------------------
 $TD -q --session "$S" "$PONG" send-async "async question" >/dev/null 2>&1
@@ -112,7 +112,7 @@ $TD -q --session "$S" "$PONG" send-async "progress probe" >/dev/null 2>&1
 out=$($TD -q --session "$S" "$PONG" progress 2>/dev/null); rc=$?
 check "progress exits 0 while pending"          [ "$rc" -eq 0 ]
 check "progress reports pending=yes"            grep -q "pending=yes" <<<"$out"
-check "progress kept the query pending"        ls "$STATE_DIR/${S}.async" >/dev/null 2>&1
+check "progress kept the query pending"        [ -e "$STATE_DIR/${S}.async" ]
 $TD -q --session "$S" "$PONG" poll --wait >/dev/null 2>&1
 $TD -q --session "$S" "$PONG" stop >/dev/null 2>&1
 $TD -q --session "$S" "$PONG" progress >/dev/null 2>&1; rc=$?
@@ -124,6 +124,14 @@ $TD -q --session "$S" "$TMPDIR_T/delay-tui.sh" start >/dev/null 2>&1
 out=$($TD -q --session "$S" "$TMPDIR_T/delay-tui.sh" send "go" 2>/dev/null); rc=$?
 check "delayed response captured (exit 0)"      [ "$rc" -eq 0 ]
 check "delayed response non-empty"              grep -q "late-reply" <<<"$out"
+# A bare poll right after send-async must not mistake "not started yet"
+# (stable, empty) for an empty answer.
+$TD -q --session "$S" "$TMPDIR_T/delay-tui.sh" send-async "go again" >/dev/null 2>&1
+out=$($TD -q --session "$S" "$TMPDIR_T/delay-tui.sh" poll 2>/dev/null); rc=$?
+check "bare poll before any output exits 2"     [ "$rc" -eq 2 ]
+check "  and keeps the query pending"           [ -e "$STATE_DIR/${S}.async" ]
+out=$($TD -q --session "$S" "$TMPDIR_T/delay-tui.sh" poll --wait 2>/dev/null)
+check "  poll --wait then gets the answer"      grep -q "late-reply" <<<"$out"
 $TD -q --session "$S" "$TMPDIR_T/delay-tui.sh" stop >/dev/null 2>&1
 
 # 6. Timeout keeps the query pending; cancel clears it -------------------------
@@ -132,7 +140,7 @@ $TD -q --session "$S" "$TMPDIR_T/spin-tui.sh" start >/dev/null 2>&1
 $TD -q --session "$S" "$TMPDIR_T/spin-tui.sh" send-async "spin" >/dev/null 2>&1
 TUI_TIMEOUT=5 $TD -q --session "$S" "$TMPDIR_T/spin-tui.sh" poll --wait >/dev/null 2>&1; rc=$?
 check "poll --wait timeout exits 3"             [ "$rc" -eq 3 ]
-check "timeout kept .async"                     ls "$STATE_DIR/${S}.async" >/dev/null 2>&1
+check "timeout kept .async"                     [ -e "$STATE_DIR/${S}.async" ]
 $TD -q --session "$S" "$TMPDIR_T/spin-tui.sh" send-async "x" >/dev/null 2>&1; rc=$?
 check "send-async while pending exits 1"        [ "$rc" -eq 1 ]
 $TD -q --session "$S" "$TMPDIR_T/spin-tui.sh" cancel >/dev/null 2>&1
@@ -159,6 +167,13 @@ $TD -q --session "$S" "$TMPDIR_T/until-tui.sh" start >/dev/null 2>&1
 out=$(TUI_TIMEOUT=20 $TD -q --until 'DONEZZZ' --session "$S" "$TMPDIR_T/until-tui.sh" send "go" 2>/dev/null); rc=$?
 check "--until exits 0 on marker"               [ "$rc" -eq 0 ]
 check "--until response contains answer"        grep -q "answer-part" <<<"$out"
+$TD -q --session "$S" "$TMPDIR_T/until-tui.sh" stop >/dev/null 2>&1
+$TD -q --session "$S" "$TMPDIR_T/until-tui.sh" start >/dev/null 2>&1
+$TD -q --session "$S" "$TMPDIR_T/until-tui.sh" send-async "go" >/dev/null 2>&1
+sleep 3
+out=$($TD -q --until 'DONEZZZ' --session "$S" "$TMPDIR_T/until-tui.sh" poll 2>/dev/null); rc=$?
+check "bare poll honours --until (exit 0)"      [ "$rc" -eq 0 ]
+check "  response contains answer"              grep -q "answer-part" <<<"$out"
 $TD -q --session "$S" "$TMPDIR_T/until-tui.sh" stop >/dev/null 2>&1
 
 # 9. Exact session targets: "p1" must not resolve to a running "p10" ----------
