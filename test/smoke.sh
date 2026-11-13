@@ -24,7 +24,7 @@ check() { # check <description> <condition...>
 
 cleanup() {
     local s
-    for s in pong delay spin dialog until pfx10 pfx1 miss once norm menu; do
+    for s in pong delay spin dialog until pfx10 pfx1 miss once norm menu multi noecho; do
         $TD -q --session "${RUN_ID}-${s}" true stop >/dev/null 2>&1 || true
     done
     $TD -q --dir "$TMPDIR_T/dflt" "$TMPDIR_T/pong-tui.sh" stop >/dev/null 2>&1 || true
@@ -67,6 +67,20 @@ read -rsn1 k
 case "$k" in 1) echo "menu-approved";; 4) echo "menu-denied";; *) echo "menu-other";; esac
 read -r rest; echo "line-after-menu:${rest}"
 read -r _
+EOF
+cat > "$TMPDIR_T/multi-tui.sh" <<'EOF'
+#!/usr/bin/env bash
+# Reads a whole multi-line paste (lines arrive together), then answers once.
+while read -r first; do
+    while read -r -t 1 _; do :; done
+    echo "multi-answer"
+done
+EOF
+cat > "$TMPDIR_T/noecho-tui.sh" <<'EOF'
+#!/usr/bin/env bash
+# Never echoes input, like a prompt swallowed by a dialog.
+stty -echo
+while read -r x; do echo "noecho-answer"; done
 EOF
 cat > "$TMPDIR_T/once-tui.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -243,7 +257,22 @@ out=$($TD -q --session "$S" "$MENU" raw 2>/dev/null)
 check "respond types the reply + Enter"         grep -q "line-after-menu:typed-reply" <<<"$out"
 $TD -q --session "$S" "$MENU" stop >/dev/null 2>&1
 
-# 13. stop cleans state; shellcheck -------------------------------------------
+# 13. Extraction: multi-line prompt echo skipped; missing anchor warned ------
+S="${RUN_ID}-multi"
+$TD -q --session "$S" "$TMPDIR_T/multi-tui.sh" start >/dev/null 2>&1
+out=$($TD -q --session "$S" "$TMPDIR_T/multi-tui.sh" send "first-line-of-prompt
+second-line-of-prompt
+last-line-of-prompt" 2>/dev/null)
+check "multi-line: answer returned"             grep -q "multi-answer" <<<"$out"
+check "  prompt lines 2+ not in the response"   bash -c "! grep -q 'line-of-prompt' <<<\"\$1\"" _ "$out"
+$TD -q --session "$S" "$TMPDIR_T/multi-tui.sh" stop >/dev/null 2>&1
+S="${RUN_ID}-noecho"
+$TD -q --session "$S" "$TMPDIR_T/noecho-tui.sh" start >/dev/null 2>&1
+errmsg=$($TD -q --session "$S" "$TMPDIR_T/noecho-tui.sh" send "never shown on screen" 2>&1 >/dev/null)
+check "missing anchor warns on stderr (-q)"     grep -q "not found on screen" <<<"$errmsg"
+$TD -q --session "$S" "$TMPDIR_T/noecho-tui.sh" stop >/dev/null 2>&1
+
+# 14. stop cleans state; shellcheck -------------------------------------------
 check "no state files left for this run"        bash -c "! ls '$STATE_DIR'/${RUN_ID}-* >/dev/null 2>&1"
 if command -v shellcheck >/dev/null 2>&1; then
     check "shellcheck clean"                    shellcheck -S style "$TD"

@@ -518,7 +518,7 @@ _await_response() {
             return 1
         fi
         if [ "$rc" -eq 0 ]; then
-            response=$(_extract_response "$prompt")
+            response=$(_extract_response "$prompt" warn)
             if [ -n "$response" ]; then
                 log "Screen stabilised"
                 printf '%s\n' "$response"
@@ -529,7 +529,7 @@ _await_response() {
         waited=$(( $(date +%s) - t0 ))
         if [ "$waited" -ge "$MAX_WAIT" ]; then
             err "Timeout after ${MAX_WAIT}s - returning what is on screen"
-            _extract_response "$prompt"
+            _extract_response "$prompt" warn
             return 3
         fi
     done
@@ -539,10 +539,13 @@ _await_response() {
 # Extract response: everything after our prompt (the only anchor we need)
 # ---------------------------------------------------------------------------
 
+# Second argument "warn": the caller is about to hand this text back as the
+# answer, so say on stderr when the prompt was not found on screen (only
+# the final extraction warns; the --until probes call this every poll).
 _extract_response() {
-    local prompt="$1"
+    local prompt="$1" warn="${2:-}"
     tmux capture-pane -t "=$TUI_SESSION:" -p -S - | \
-        _TUI_PROMPT="$prompt" \
+        _TUI_PROMPT="$prompt" _TUI_WARN="$warn" _TUI_SESSION="$TUI_SESSION" \
         python3 -c '
 import sys, os
 
@@ -568,9 +571,26 @@ for cut in (80, 40):
     if len(first_line) <= cut:
         break
 
-# Everything after our prompt is the response
+# Everything after our prompt is the response. A multi-line prompt is
+# echoed line by line, so skip past the echo of its LAST line too: look for
+# it just below the anchor (a window sized for the prompt plus wrapping)
+# and take the first match, which is the echo, not a later quote of it.
 if prompt_line >= 0:
     lines = lines[prompt_line + 1:]
+    rest = [l.strip() for l in prompt.strip().splitlines()[1:] if l.strip()]
+    if rest:
+        last_needle = rest[-1][:40].strip()
+        window = 3 * (len(rest) + 1) + 5
+        for i, line in enumerate(lines[:window]):
+            if last_needle in line:
+                lines = lines[i + 1:]
+                break
+elif first_line and os.environ.get("_TUI_WARN"):
+    sys.stderr.write(
+        "[tui-driver:%s] Warning: the prompt was not found on screen, so the "
+        "whole screen is returned. It may have been taken by a dialog (e.g. a "
+        "startup trust prompt) instead of reaching the input box.\n"
+        % os.environ.get("_TUI_SESSION", "tui-driver"))
 
 # Trim leading / trailing blank lines
 while lines and not lines[0].strip():
@@ -944,7 +964,7 @@ cmd_poll() {
         fi
         if [ "$done_now" = true ]; then
             local response
-            response=$(_extract_response "$prompt")
+            response=$(_extract_response "$prompt" warn)
             if [ -n "$response" ]; then
                 log "Screen stable"
                 printf '%s\n' "$response"
