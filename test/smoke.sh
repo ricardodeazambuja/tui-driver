@@ -24,7 +24,7 @@ check() { # check <description> <condition...>
 
 cleanup() {
     local s
-    for s in pong delay spin dialog until; do
+    for s in pong delay spin dialog until pfx10 pfx1; do
         $TD -q --session "${RUN_ID}-${s}" true stop >/dev/null 2>&1 || true
     done
     rm -rf "$TMPDIR_T"
@@ -146,7 +146,19 @@ check "--until exits 0 on marker"               [ "$rc" -eq 0 ]
 check "--until response contains answer"        grep -q "answer-part" <<<"$out"
 $TD -q --session "$S" "$TMPDIR_T/until-tui.sh" stop >/dev/null 2>&1
 
-# 9. stop cleans state; shellcheck --------------------------------------------
+# 9. Exact session targets: "p1" must not resolve to a running "p10" ----------
+S="${RUN_ID}-pfx10"
+$TD -q --session "$S" "$PONG" start >/dev/null 2>&1
+out=$($TD -q --session "${RUN_ID}-pfx1" "$PONG" status 2>/dev/null)
+check "prefix name reports stopped"             [ "$out" = "stopped" ]
+$TD -q --session "${RUN_ID}-pfx1" "$PONG" send-async "wrong session" >/dev/null 2>&1; rc=$?
+check "send-async to prefix name exits 1"       [ "$rc" -eq 1 ]
+$TD -q --session "${RUN_ID}-pfx1" "$PONG" stop >/dev/null 2>&1
+out=$($TD -q --session "$S" "$PONG" status 2>/dev/null)
+check "stop on prefix name spared the other"    [ "$out" = "running" ]
+$TD -q --session "$S" "$PONG" stop >/dev/null 2>&1
+
+# 10. stop cleans state; shellcheck -------------------------------------------
 check "no state files left for this run"        bash -c "! ls '$STATE_DIR'/${RUN_ID}-* >/dev/null 2>&1"
 if command -v shellcheck >/dev/null 2>&1; then
     check "shellcheck clean"                    shellcheck -S style "$TD"

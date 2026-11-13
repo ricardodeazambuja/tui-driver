@@ -114,7 +114,7 @@ _default_session() {
     if [ -f "$lock" ]; then
         local existing
         existing=$(cat "$lock")
-        if tmux has-session -t "$existing" 2>/dev/null; then
+        if tmux has-session -t "=$existing" 2>/dev/null; then
             echo "$existing"
             return
         fi
@@ -139,6 +139,12 @@ esac
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# tmux targets are ALWAYS written "=NAME" (session commands) or "=NAME:"
+# (pane commands). A bare "-t NAME" falls back to prefix and glob matching
+# when no session is called exactly NAME, so with session "p10" running,
+# "--session p1 stop" used to kill p10, and a send to p1 landed in p10.
+# Never add a tmux call with a bare session name.
 
 log() {
     [[ "$QUIET" == "true" ]] && return
@@ -212,7 +218,7 @@ _start_watchdog() {
             sleep 30
             # If the session is gone (stopped, crashed, killed elsewhere),
             # clean up our own per-session state so it does not leak into /tmp.
-            if ! tmux has-session -t "$session" 2>/dev/null; then
+            if ! tmux has-session -t "=$session" 2>/dev/null; then
                 rm -f "$stamp" "$async" "$poll_hash" "$watchdog" "$last_send" "$prompt_f"
                 _rm_owned_lock "$session"
                 break
@@ -224,14 +230,14 @@ _start_watchdog() {
                 now=$(date +%s)
                 idle=$((now - last))
                 if [ "$idle" -gt "$timeout" ]; then
-                    tmux kill-session -t "$session" 2>/dev/null || true
+                    tmux kill-session -t "=$session" 2>/dev/null || true
                     rm -f "$stamp" "$async" "$poll_hash" "$watchdog" "$last_send" "$prompt_f"
                     _rm_owned_lock "$session"
                     break
                 fi
             else
                 # No stamp file — caller probably died without stopping
-                tmux kill-session -t "$session" 2>/dev/null || true
+                tmux kill-session -t "=$session" 2>/dev/null || true
                 rm -f "$async" "$poll_hash" "$watchdog" "$last_send" "$prompt_f"
                 _rm_owned_lock "$session"
                 break
@@ -282,7 +288,7 @@ _mark_send() {
 }
 
 _capture() {
-    tmux capture-pane -t "$TUI_SESSION" -p 2>/dev/null || true
+    tmux capture-pane -t "=$TUI_SESSION:" -p 2>/dev/null || true
 }
 
 _screen_hash() {
@@ -392,7 +398,7 @@ _await_response() {
 
 _extract_response() {
     local prompt="$1"
-    tmux capture-pane -t "$TUI_SESSION" -p -S - | \
+    tmux capture-pane -t "=$TUI_SESSION:" -p -S - | \
         _TUI_PROMPT="$prompt" \
         python3 -c '
 import sys, os
@@ -440,7 +446,7 @@ if lines:
 # the other's prompt. A per-session buffer name makes concurrent sends safe.
 _paste() {
     printf '%s' "$1" | tmux load-buffer -b "$TUI_SESSION" -
-    tmux paste-buffer -b "$TUI_SESSION" -t "$TUI_SESSION" -p -d
+    tmux paste-buffer -b "$TUI_SESSION" -t "=$TUI_SESSION:" -p -d
 }
 
 # ---------------------------------------------------------------------------
@@ -449,7 +455,7 @@ _paste() {
 
 cmd_start() {
     # Prevent starting if a session already exists for this TUI
-    if tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
+    if tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
         err "Error: session '$TUI_SESSION' is already running."
         err "Run 'tui-driver $TUI_CMD stop' first, then start again."
         return 1
@@ -465,7 +471,7 @@ cmd_start() {
         if [ -f "$lock" ]; then
             local existing
             existing=$(cat "$lock")
-            if tmux has-session -t "$existing" 2>/dev/null; then
+            if tmux has-session -t "=$existing" 2>/dev/null; then
                 err "Error: another session '$existing' is already running for this command+directory."
                 err "Run 'tui-driver $TUI_CMD stop' first, or pass --session NAME to start a second, independent session."
                 return 1
@@ -484,7 +490,7 @@ cmd_start() {
 
     log "Creating tmux session '$TUI_SESSION' ..."
     tmux new-session -s "$TUI_SESSION" -d -x "$TERM_WIDTH" -y "$TERM_HEIGHT"
-    tmux send-keys -t "$TUI_SESSION" "cd $(printf '%q' "$WORK_DIR") && $TUI_CMD" Enter
+    tmux send-keys -t "=$TUI_SESSION:" "cd $(printf '%q' "$WORK_DIR") && $TUI_CMD" Enter
 
     # Spawn a watchdog that kills the session if the caller dies.
     _start_watchdog
@@ -503,7 +509,7 @@ cmd_start() {
 cmd_send() {
     local prompt="${1:?Usage: tui-driver $TUI_CMD send \"your prompt\"}"
 
-    if ! tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
+    if ! tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
         err "Error: no session running. Run 'tui-driver $TUI_CMD start' first."
         return 1
     fi
@@ -518,7 +524,7 @@ cmd_send() {
     # Send via bracketed paste (safe with !, ?, @, etc.)
     _paste "$prompt"
     sleep "$PASTE_DELAY"
-    tmux send-keys -t "$TUI_SESSION" Enter
+    tmux send-keys -t "=$TUI_SESSION:" Enter
     _mark_send
     # Remember the prompt: it is the extraction anchor for respond --async
     # and for a send that times out and converts to a pending async query.
@@ -538,7 +544,7 @@ cmd_send() {
         _stamp
         return 3
     fi
-    tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
+    tmux clear-history -t "=$TUI_SESSION:" 2>/dev/null || true
     _stamp
     return "$rc"
 }
@@ -555,7 +561,7 @@ cmd_respond() {
     fi
     local reply="${*:-}"
 
-    if ! tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
+    if ! tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
         err "Error: no session running."
         return 1
     fi
@@ -571,7 +577,7 @@ cmd_respond() {
         _paste "$reply"
         sleep 0.3
     fi
-    tmux send-keys -t "$TUI_SESSION" Enter
+    tmux send-keys -t "=$TUI_SESSION:" Enter
 
     if [ "$async_mode" = true ]; then
         local prompt_file
@@ -597,14 +603,14 @@ cmd_respond() {
     if _wait_stable; then
         log "Screen stabilised"
         _capture
-        tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
+        tmux clear-history -t "=$TUI_SESSION:" 2>/dev/null || true
         _stamp
         return 0
     fi
 
     err "Timeout after ${MAX_WAIT}s"
     _capture
-    tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
+    tmux clear-history -t "=$TUI_SESSION:" 2>/dev/null || true
     _stamp
     return 3
 }
@@ -630,7 +636,7 @@ cmd_respond() {
 cmd_send_async() {
     local prompt="${1:?Usage: tui-driver $TUI_CMD send-async \"your prompt\"}"
 
-    if ! tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
+    if ! tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
         err "Error: no session running. Run 'tui-driver $TUI_CMD start' first."
         return 1
     fi
@@ -649,7 +655,7 @@ cmd_send_async() {
     # Send via bracketed paste (safe with !, ?, @, etc.)
     _paste "$prompt"
     sleep "$PASTE_DELAY"
-    tmux send-keys -t "$TUI_SESSION" Enter
+    tmux send-keys -t "=$TUI_SESSION:" Enter
     _mark_send
     # Remember the prompt: it is the extraction anchor for respond --async
     # and for a send that times out and converts to a pending async query.
@@ -669,7 +675,7 @@ cmd_poll() {
         wait_mode=true
     fi
 
-    if ! tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
+    if ! tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
         err "Error: no session running."
         return 1
     fi
@@ -700,7 +706,7 @@ cmd_poll() {
             _stamp
             return 3
         fi
-        tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
+        tmux clear-history -t "=$TUI_SESSION:" 2>/dev/null || true
         rm -f "$async_file" "$poll_hash_file"
         _stamp
         return "$rc"
@@ -737,7 +743,7 @@ cmd_poll() {
         if [ "$stable" -ge "$STABLE_COUNT" ]; then
             log "Screen stable"
             _extract_response "$prompt"
-            tmux clear-history -t "$TUI_SESSION" 2>/dev/null || true
+            tmux clear-history -t "=$TUI_SESSION:" 2>/dev/null || true
             rm -f "$async_file" "$poll_hash_file"
             return 0
         fi
@@ -767,8 +773,8 @@ cmd_cancel() {
 
 cmd_stop() {
     _stop_watchdog
-    if tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
-        tmux kill-session -t "$TUI_SESSION"
+    if tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
+        tmux kill-session -t "=$TUI_SESSION"
         log "Session stopped"
     else
         log "No session to stop"
@@ -778,7 +784,7 @@ cmd_stop() {
 }
 
 cmd_status() {
-    if tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
+    if tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
         echo "running"
     else
         echo "stopped"
@@ -794,7 +800,7 @@ cmd_progress() {
     # never consumes the response or clears the pending record, and unlike
     # raw it answers the actual question ("is it still working?") without a
     # screen dump. Safe to run at any time, any number of times.
-    if ! tmux has-session -t "$TUI_SESSION" 2>/dev/null; then
+    if ! tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
         echo "session=stopped"
         return 1
     fi
@@ -881,7 +887,7 @@ _iter_managed_sessions() {
         else
             idle=-1
         fi
-        if tmux has-session -t "$session" 2>/dev/null; then alive=1; else alive=0; fi
+        if tmux has-session -t "=$session" 2>/dev/null; then alive=1; else alive=0; fi
         printf '%s\t%s\t%s\t%s\n' "$session" "$pid" "$idle" "$alive"
     done
     # Stamps without a watchdog file: a watchdog that cleaned up can race a
@@ -895,7 +901,7 @@ _iter_managed_sessions() {
         session=${session%.stamp}
         last=$(cat "$st" 2>/dev/null || echo "$now")
         idle=$((now - last))
-        if tmux has-session -t "$session" 2>/dev/null; then alive=1; else alive=0; fi
+        if tmux has-session -t "=$session" 2>/dev/null; then alive=1; else alive=0; fi
         printf '%s\t%s\t%s\t%s\n' "$session" "none" "$idle" "$alive"
     done
     shopt -u nullglob
@@ -963,7 +969,7 @@ cmd_reap() {
             continue
         fi
         # Dead watchdog AND idle past threshold → true orphan.
-        tmux kill-session -t "$session" 2>/dev/null || true
+        tmux kill-session -t "=$session" 2>/dev/null || true
         _clear_session_state "$session"
         log "reaped orphan session '$session' (idle ${idle}s, watchdog dead)"
         reaped=$((reaped + 1))
