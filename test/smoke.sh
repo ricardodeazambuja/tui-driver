@@ -276,7 +276,7 @@ $TD -q --session "$S" "$TMPDIR_T/noecho-tui.sh" stop >/dev/null 2>&1
 # 14. stop cleans state; shellcheck -------------------------------------------
 check "no state files left for this run"        bash -c "! ls '$STATE_DIR'/${RUN_ID}-* >/dev/null 2>&1"
 if command -v shellcheck >/dev/null 2>&1; then
-    check "shellcheck clean"                    shellcheck -S style "$TD"
+    check "shellcheck clean"                    shellcheck -S style "$(command -v "$TD" || echo "$TD")"
 else
     echo "skip - shellcheck not installed"
 fi
