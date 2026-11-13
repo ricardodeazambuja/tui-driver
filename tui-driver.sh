@@ -101,16 +101,42 @@ case "$TUI_CMD" in
         ;;
 esac
 
+_md5_8() {
+    if command -v md5sum &>/dev/null; then
+        printf '%s' "$1" | md5sum | cut -c1-8
+    else
+        printf '%s' "$1" | md5 | cut -c1-8
+    fi
+}
+
+# tmux silently rewrites "." and ":" in session names to "_" (they are
+# target separators), so a name built from "./x.sh" or "foo.sh" named a
+# session that did not exist: start failed and leaked the real one. Generated
+# names and lock keys therefore keep only [A-Za-z0-9_-]. Plain command names
+# (agy, agy-web, claude, ...) are unchanged, so locks of sessions started by
+# an older version are still found after an upgrade.
+_safe_name() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '_'
+}
+
+# Lock path for this command+directory. A command that had to be rewritten
+# hashes the original command string too, so "a.b" and "a_b" never share
+# a lock.
+_lock_path() {
+    local safe
+    safe=$(_safe_name "$TUI_CMD")
+    if [ "$safe" = "$TUI_CMD" ]; then
+        echo "${STATE_DIR}/${safe}-$(_md5_8 "$WORK_DIR").lock"
+    else
+        echo "${STATE_DIR}/${safe}-$(_md5_8 "${TUI_CMD}|${WORK_DIR}").lock"
+    fi
+}
+
 # Session name: if a lock file exists for this TUI+dir combo, reuse that
 # session name. Otherwise generate a new one with a random suffix.
 _default_session() {
-    local dir_hash
-    if command -v md5sum &>/dev/null; then
-        dir_hash=$(printf '%s' "$WORK_DIR" | md5sum | cut -c1-8)
-    else
-        dir_hash=$(printf '%s' "$WORK_DIR" | md5 | cut -c1-8)
-    fi
-    local lock="${STATE_DIR}/${TUI_CMD}-${dir_hash}.lock"
+    local lock
+    lock=$(_lock_path)
     if [ -f "$lock" ]; then
         local existing
         existing=$(cat "$lock")
@@ -120,7 +146,7 @@ _default_session() {
         fi
     fi
     # New session: random suffix to avoid collisions with other callers
-    echo "tui-${TUI_CMD}-${RANDOM}${RANDOM}"
+    echo "tui-$(_safe_name "$TUI_CMD")-${RANDOM}${RANDOM}"
 }
 # Explicit "--session NAME" is a full escape hatch: it bypasses the cmd+dir
 # lock entirely, so multiple agents in the SAME directory can each drive their
@@ -132,6 +158,11 @@ case "$ACTION" in
     *)
         if [ -z "${TUI_SESSION:-}" ]; then
             TUI_SESSION="$(_default_session)"
+        elif [ "$(_safe_name "$TUI_SESSION")" != "$TUI_SESSION" ]; then
+            # Rewriting an explicit name silently would make it point at a
+            # different session than the caller named, so refuse instead.
+            echo "Error: invalid session name '$TUI_SESSION': use only letters, digits, '_' and '-' (tmux rewrites '.' and ':')." >&2
+            exit 1
         fi
         ;;
 esac
@@ -166,13 +197,7 @@ _prompt_file()   { echo "${STATE_DIR}/${TUI_SESSION}.prompt"; }
 _lock_file() {
     # Lock is keyed on command+directory, NOT session name.
     # This lets _default_session find the right session.
-    local dir_hash
-    if command -v md5sum &>/dev/null; then
-        dir_hash=$(printf '%s' "$WORK_DIR" | md5sum | cut -c1-8)
-    else
-        dir_hash=$(printf '%s' "$WORK_DIR" | md5 | cut -c1-8)
-    fi
-    echo "${STATE_DIR}/${TUI_CMD}-${dir_hash}.lock"
+    _lock_path
 }
 
 _rm_owned_lock() {

@@ -27,6 +27,7 @@ cleanup() {
     for s in pong delay spin dialog until pfx10 pfx1; do
         $TD -q --session "${RUN_ID}-${s}" true stop >/dev/null 2>&1 || true
     done
+    $TD -q --dir "$TMPDIR_T/dflt" "$TMPDIR_T/pong-tui.sh" stop >/dev/null 2>&1 || true
     rm -rf "$TMPDIR_T"
 }
 trap cleanup EXIT
@@ -158,7 +159,19 @@ out=$($TD -q --session "$S" "$PONG" status 2>/dev/null)
 check "stop on prefix name spared the other"    [ "$out" = "running" ]
 $TD -q --session "$S" "$PONG" stop >/dev/null 2>&1
 
-# 10. stop cleans state; shellcheck -------------------------------------------
+# 10. Names: default session for a path command; invalid explicit name --------
+DFLT="$TMPDIR_T/dflt"; mkdir -p "$DFLT"
+$TD -q --dir "$DFLT" "$PONG" start >/dev/null 2>&1; rc=$?
+check "default session for ./path.sh starts"    [ "$rc" -eq 0 ]
+out=$($TD -q --dir "$DFLT" "$PONG" send "dotted name" 2>/dev/null)
+check "default session for ./path.sh answers"   grep -q "pong-response" <<<"$out"
+$TD -q --dir "$DFLT" "$PONG" stop >/dev/null 2>&1
+out=$($TD -q --dir "$DFLT" "$PONG" status 2>/dev/null)
+check "default session for ./path.sh stopped"   [ "$out" = "stopped" ]
+$TD -q --session "bad.name" "$PONG" status >/dev/null 2>&1; rc=$?
+check "session name with '.' rejected (exit 1)" [ "$rc" -eq 1 ]
+
+# 11. stop cleans state; shellcheck -------------------------------------------
 check "no state files left for this run"        bash -c "! ls '$STATE_DIR'/${RUN_ID}-* >/dev/null 2>&1"
 if command -v shellcheck >/dev/null 2>&1; then
     check "shellcheck clean"                    shellcheck -S style "$TD"
