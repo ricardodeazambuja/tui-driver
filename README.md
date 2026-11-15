@@ -21,7 +21,7 @@ An agent such as Claude Code can use it to:
 - **Fan out work in parallel.** Fire queries at several sessions with
   `send-async`, keep working, and collect results with `poll` — whose
   exit codes (0 = ready, 2 = still working, 3 = timed out but the query
-  stays pending) are designed to be loop conditions in a script.
+  stays pending, 4 = the prompt never arrived) are designed to be loop conditions in a script.
 - **Isolate context.** Delegate a large, self-contained sub-task to an
   independent CLI session with its own fresh context window, so the
   sub-task's output never bloats the orchestrating agent's context.
@@ -382,7 +382,9 @@ screen never settles (spinners, clocks) or that pauses mid-response can
 fool it. When you control the prompt — always true with AI TUIs — you can
 opt into exact completion instead: instruct the TUI to end with a marker
 and pass `--until REGEX` (or `TUI_DONE_PATTERN`). The response is returned
-the moment the marker appears in it, no stability tail:
+the moment the marker appears in it, no stability tail — and **only** then:
+with `--until`, a still screen never ends the wait (before 0.5.0 it did, so
+a TUI sitting on a long build or git hook was reported finished, exit 0):
 
 ```bash
 tui-driver --until 'DONE!!!' agy send \
@@ -390,8 +392,34 @@ tui-driver --until 'DONE!!!' agy send \
 ```
 
 Word the instruction so the literal marker is **not** in your prompt
-(describe it, as above) — otherwise the echo of your own prompt can match
-the pattern prematurely.
+(describe it, as above). If it is spelled out anyway, tui-driver requires
+the marker to appear more times on screen than in the prompt, so the echo
+alone cannot end the wait.
+
+The flip side of a strict marker: an approval dialog, or a TUI that never
+prints the marker, holds the wait until `TUI_TIMEOUT` (exit 3, query kept
+pending). On long waits, check with `progress`; answer a dialog with
+`respond --async --key ...` and poll again.
+
+**Delivery check (exit 4).** `send` and `send-async` confirm that the prompt
+reached the TUI: after Enter, its first line must show up on screen (more
+often than before the paste) within `TUI_DELIVER_WAIT` seconds. If a dialog
+or overlay swallowed it, they fail with **exit 4** and print the screen;
+nothing is left pending. `poll` also returns 4 for a pending prompt that was
+never seen arriving and is not on screen. (A prompt that *was* seen arriving
+and later scrolled away — full-screen TUIs do that on long answers — is
+fine: `poll` returns the whole screen with a warning, exit 0.) The check
+proves the text landed, not that the TUI accepted the Enter.
+
+**Overlays at startup.** Some TUIs draw notices over the input box that eat
+the next keystrokes — agy shows "... esc to dismiss" banners after an
+update. `start` (and every send) presses `TUI_DISMISS_KEY` (Escape) while
+`TUI_DISMISS_PATTERN` matches the bottom of the visible screen, up to
+`TUI_DISMISS_TRIES` times, logging each press, and `start` fails (exit 1)
+if one is still there. The default pattern is `esc to dismiss` for commands
+named `agy*` and none for anything else: in `claude`, Escape at the prompt is
+not harmless, and its trust dialog is a decision to make, not a notice to
+click away. Set `TUI_DISMISS_PATTERN=''` to turn it off.
 
 **`TUI_TIMEOUT` vs `TUI_WATCHDOG`.** These bound two different things and do
 not interfere:
@@ -494,14 +522,14 @@ Hooks are snapshotted at startup, so restart Claude Code afterwards.
 
 | Action | Description | Blocking | Exit code |
 |--------|-------------|----------|-----------|
-| `start` | Launch TUI in tmux, wait for it to be ready | Yes | 0 = ready, 3 = timeout |
-| `send "prompt"` | Send prompt, wait for a non-empty response | Yes | 0 = ready, 3 = timeout (query stays pending) |
-| `send-async "prompt"` | Send prompt, return immediately | No | 0 = sent, 1 = error |
-| `poll` | Self-contained stability probe (~`TUI_STABLE`×`TUI_POLL`s): returns the full response if ready, else `waiting` | Brief | 0 = ready, 2 = still changing |
-| `poll --wait` | Block until async response is ready | Yes | 0 = ready, 3 = timeout (query stays pending) |
+| `start` | Launch TUI in tmux, wait for it to be ready, dismiss startup overlays | Yes | 0 = ready, 1 = error / overlay stuck, 3 = timeout |
+| `send "prompt"` | Send prompt, confirm delivery, wait for a non-empty response | Yes | 0 = ready, 3 = timeout (query stays pending), 4 = not delivered |
+| `send-async "prompt"` | Send prompt, confirm delivery (≤ `TUI_DELIVER_WAIT`s), return | Brief | 0 = sent, 1 = error, 4 = not delivered |
+| `poll` | Self-contained stability probe (~`TUI_STABLE`×`TUI_POLL`s): returns the full response if ready, else `waiting` | Brief | 0 = ready, 2 = still changing, 4 = not delivered |
+| `poll --wait` | Block until async response is ready | Yes | 0 = ready, 3 = timeout (query stays pending), 4 = not delivered |
 | `progress` | Read-only check on a pending query: pending?, elapsed, screen changing?, last lines. Never consumes anything | ~1s | 0, 1 = no session |
 | `respond "reply"` | Type a short reply + Enter (line prompts; `""` = just Enter), print resulting screen | Yes | 0 = stable, 3 = timeout |
-| `respond --key K [K...]` | Send tmux key names (`1`, `4`, `Escape`, `Down`, `C-c`, ...) with **no** Enter — for menus that act on a keypress | Yes | 0 = stable, 3 = timeout |
+| `respond --key K [K...]` | Send tmux key names (`1`, `4`, `Escape`, `Down`, `C-c`, ...) with **no** Enter — for menus that act on a keypress. Prints the screen one `TUI_POLL` later (no stability wait) | Brief | 0 |
 | `respond --async [--key] ...` | Same reply, return at once and re-arm the pending query for `poll` | No | 0 = sent, 1 = error |
 | `cancel` | Drop a pending async query (session keeps running) | No | 0 |
 | `stop` | Kill session and clean up | No | 0 |
@@ -516,7 +544,9 @@ Hooks are snapshotted at startup, so restart Claude Code afterwards.
 Exit code 1 always means a hard error (no session, the TUI exited, no
 pending async, bad usage) and is explained on stderr — even under `--quiet`. Code 2 means
 "not ready yet, ask again"; code 3 means "timed out" (for `send`/`poll
---wait` the query stays pending and can still be retrieved).
+--wait` the query stays pending and can still be retrieved). Code 4 means
+"the prompt was not delivered": a dialog or overlay took it, the screen is
+printed, nothing is pending; dismiss it and send again.
 
 `list` and `reap` are global — they operate across every working directory
 and TUI command, so you can inspect or clean up sessions you started from
@@ -528,7 +558,7 @@ elsewhere (or that were orphaned when a caller died).
 |------|-------------|
 | `--session NAME` | Run an independent named session. Bypasses the per-directory lock, so multiple agents can drive the same command from the same directory in parallel (see below). Pass the same NAME to every `send`/`respond`/`poll`/`stop`. |
 | `--dir DIR` | Set the working directory for the TUI process |
-| `--until REGEX` | Treat the response as complete the moment REGEX appears in it (see "Exact completion with a marker") |
+| `--until REGEX` | The response is complete when REGEX appears in it, and only then — screen stability no longer counts (see "Exact completion with a marker") |
 | `--quiet`, `-q` | Suppress stderr progress logs (errors are always shown) |
 | `--version`, `-v` | Print the tui-driver version |
 
@@ -550,6 +580,10 @@ elsewhere (or that were orphaned when a caller died).
 | `TUI_START_TIMEOUT` | `60` | Max seconds to wait for the TUI at startup |
 | `TUI_HEARTBEAT` | `15` | "still waiting" log line every N seconds while blocked (0 = off) |
 | `TUI_DONE_PATTERN` | unset | Completion regex, same as `--until` |
+| `TUI_DELIVER_WAIT` | `10` | Max seconds for a sent prompt to appear on screen before exit 4 (0 = don't check at send time) |
+| `TUI_DISMISS_PATTERN` | `esc to dismiss` for `agy*`, else unset | Regex of an input-eating overlay to dismiss at start and before each send (`''` = off) |
+| `TUI_DISMISS_KEY` | `Escape` | Key that dismisses it |
+| `TUI_DISMISS_TRIES` | `5` | Max presses per check |
 
 ## Design decisions
 

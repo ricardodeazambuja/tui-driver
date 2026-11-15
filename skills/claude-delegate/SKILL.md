@@ -141,7 +141,9 @@ be notified when the result arrives.
   changing?, last screen lines). Never use `raw` for monitoring; it's for
   debugging a session that already misbehaves.
 - Exit codes: `0` ready, `1` hard error (reason on stderr even with `-q`),
-  `2` still working, `3` timeout.
+  `2` still working, `3` timeout, `4` the prompt was **not delivered** (a
+  dialog took it; the screen is printed, nothing is pending — answer the
+  dialog, then send again). Never treat a non-zero exit as a result.
 
 **Long tasks need a bigger timeout.** The default `TUI_TIMEOUT` is 300s. A
 substantial coding/exploration task can exceed that — set `TUI_TIMEOUT` (e.g.
@@ -157,6 +159,11 @@ mistaken for completion:
 tui-driver claude send-async "…do the task… When completely finished, print the word DONE followed by three exclamation marks on its own line."
 TUI_TIMEOUT=900 tui-driver -q --until 'DONE!!!' claude poll --wait
 ```
+
+With `--until`, only the marker ends the wait: a still screen (a long build,
+a git hook) does not. The flip side is that a permission dialog holds the wait
+until `TUI_TIMEOUT` (exit 3, task kept pending), so check long waits with
+`progress`.
 
 (Describe the marker in the prompt rather than spelling it out, so the echo
 of your own prompt can't match the pattern.)

@@ -24,7 +24,8 @@ check() { # check <description> <condition...>
 
 cleanup() {
     local s
-    for s in pong delay spin dialog until pfx10 pfx1 miss once norm menu multi noecho; do
+    for s in pong delay spin dialog until pfx10 pfx1 miss once norm menu multi noecho \
+             ovl ovloff static alt; do
         $TD -q --session "${RUN_ID}-${s}" true stop >/dev/null 2>&1 || true
     done
     $TD -q --dir "$TMPDIR_T/dflt" "$TMPDIR_T/pong-tui.sh" stop >/dev/null 2>&1 || true
@@ -93,6 +94,34 @@ echo "answer-part"
 echo "DONEZZZ"
 while true; do date; sleep 1; done
 EOF
+cat > "$TMPDIR_T/agy-overlay-tui.sh" <<'EOF2'
+#!/usr/bin/env bash
+# Two startup notices over the input, like agy's: each swallows every key
+# until Escape; the second shows only after the first is dismissed. Named
+# agy-* so the built-in agy dismiss pattern applies.
+for n in 1 2; do
+    echo "Notice $n: something new  esc to dismiss"
+    while IFS= read -rsn1 k; do [ "$k" = $'\e' ] && break; done
+    clear
+done
+while read -r x; do echo "overlay-answer"; done
+EOF2
+cat > "$TMPDIR_T/static-tui.sh" <<'EOF2'
+#!/usr/bin/env bash
+# A long tool call: one static line for much longer than TUI_STABLE*TUI_POLL.
+read -r x
+echo "working..."
+sleep 12
+echo "answer-static"
+echo "DONEZZZ"
+read -r _
+EOF2
+cat > "$TMPDIR_T/alt-tui.sh" <<'EOF2'
+#!/usr/bin/env bash
+# Echoes the prompt, then answers on the alternate screen, where the echo is
+# gone: a delivered prompt that later scrolls away is not an error.
+while read -r x; do sleep 2; tput smcup; clear; echo "alt-answer"; done
+EOF2
 chmod +x "$TMPDIR_T"/*.sh
 
 # 1. Errors visible under -q, distinct exit codes ------------------------------
@@ -269,9 +298,69 @@ check "  prompt lines 2+ not in the response"   bash -c "! grep -q 'line-of-prom
 $TD -q --session "$S" "$TMPDIR_T/multi-tui.sh" stop >/dev/null 2>&1
 S="${RUN_ID}-noecho"
 $TD -q --session "$S" "$TMPDIR_T/noecho-tui.sh" start >/dev/null 2>&1
-errmsg=$($TD -q --session "$S" "$TMPDIR_T/noecho-tui.sh" send "never shown on screen" 2>&1 >/dev/null)
-check "missing anchor warns on stderr (-q)"     grep -q "not found on screen" <<<"$errmsg"
+errmsg=$(TUI_DELIVER_WAIT=3 $TD -q --session "$S" "$TMPDIR_T/noecho-tui.sh" send "never shown on screen" 2>&1 >/dev/null); rc=$?
+check "prompt never on screen: send exits 4"    [ "$rc" -eq 4 ]
+check "  says not delivered on stderr (-q)"     grep -q "not delivered" <<<"$errmsg"
 $TD -q --session "$S" "$TMPDIR_T/noecho-tui.sh" stop >/dev/null 2>&1
+S="${RUN_ID}-alt"
+$TD -q --session "$S" "$TMPDIR_T/alt-tui.sh" start >/dev/null 2>&1
+out=$($TD -q --session "$S" "$TMPDIR_T/alt-tui.sh" send "alt screen question" 2>"$TMPDIR_T/alt.err"); rc=$?
+check "delivered prompt later scrolled away: exit 0" [ "$rc" -eq 0 ]
+check "  answer returned"                       grep -q "alt-answer" <<<"$out"
+check "  missing anchor still warned"           grep -q "not found on screen" "$TMPDIR_T/alt.err"
+$TD -q --session "$S" "$TMPDIR_T/alt-tui.sh" stop >/dev/null 2>&1
+
+# 13b. Overlays: start dismisses them; without dismissal the send fails -------
+S="${RUN_ID}-ovl"
+OVL="$TMPDIR_T/agy-overlay-tui.sh"
+errmsg=$($TD --session "$S" "$OVL" start 2>&1 >/dev/null); rc=$?
+check "start with two overlays exits 0"         [ "$rc" -eq 0 ]
+check "  logged both dismissals"                [ "$(grep -c 'Dismissing overlay' <<<"$errmsg")" -eq 2 ]
+out=$($TD -q --session "$S" "$OVL" raw 2>/dev/null)
+check "  no overlay left on screen"             bash -c "! grep -q 'esc to dismiss' <<<\"\$1\"" _ "$out"
+out=$($TD -q --session "$S" "$OVL" send "after the overlays" 2>/dev/null); rc=$?
+check "  send then reaches the TUI (exit 0)"    [ "$rc" -eq 0 ]
+check "  answer returned"                       grep -q "overlay-answer" <<<"$out"
+$TD -q --session "$S" "$OVL" stop >/dev/null 2>&1
+S="${RUN_ID}-ovloff"
+TUI_DISMISS_PATTERN='' $TD -q --session "$S" "$OVL" start >/dev/null 2>&1
+out=$(TUI_DISMISS_PATTERN='' TUI_DELIVER_WAIT=3 $TD -q --session "$S" "$OVL" send-async "eaten by the overlay" 2>/dev/null); rc=$?
+check "overlay eats send-async: exit 4"         [ "$rc" -eq 4 ]
+check "  screen printed"                        grep -q "esc to dismiss" <<<"$out"
+check "  nothing left pending"                  [ ! -e "$STATE_DIR/${S}.async" ]
+# A query armed by an older version (no delivery record) whose prompt is
+# not on screen: poll must not hand back the screen as the answer.
+printf 'eaten by the overlay\n' > "$STATE_DIR/${S}.async"
+$TD -q --session "$S" "$OVL" poll --wait >/dev/null 2>&1; rc=$?
+check "poll of an undelivered prompt exits 4"   [ "$rc" -eq 4 ]
+check "  and drops the pending query"           [ ! -e "$STATE_DIR/${S}.async" ]
+t0=$(date +%s)
+TUI_DISMISS_PATTERN='' TUI_TIMEOUT=60 $TD -q --session "$S" "$OVL" respond --key Escape >/dev/null 2>&1; rc=$?
+t1=$(date +%s)
+check "respond --key returns quickly (exit 0)"  [ "$rc" -eq 0 ] && [ $((t1 - t0)) -lt 6 ]
+$TD -q --session "$S" "$OVL" stop >/dev/null 2>&1
+
+# 13c. --until is strict: a long static screen does not end the wait ----------
+S="${RUN_ID}-static"
+ST="$TMPDIR_T/static-tui.sh"
+$TD -q --session "$S" "$ST" start >/dev/null 2>&1
+$TD -q --session "$S" "$ST" send-async "run the long job" >/dev/null 2>&1
+sleep 3
+TUI_POLL=1 $TD -q --until 'DONEZZZ' --session "$S" "$ST" poll >/dev/null 2>&1; rc=$?
+check "bare poll --until on a static screen: 2" [ "$rc" -eq 2 ]
+t0=$(date +%s)
+out=$(TUI_POLL=1 TUI_TIMEOUT=40 $TD -q --until 'DONEZZZ' --session "$S" "$ST" poll --wait 2>/dev/null); rc=$?
+t1=$(date +%s)
+check "poll --wait --until waits for the marker" [ "$rc" -eq 0 ] && grep -q "answer-static" <<<"$out"
+check "  (held through the static stretch)"     [ $((t1 - t0)) -ge 5 ]
+$TD -q --session "$S" "$ST" stop >/dev/null 2>&1
+$TD -q --session "$S" "$ST" start >/dev/null 2>&1
+t0=$(date +%s)
+out=$(TUI_POLL=1 TUI_TIMEOUT=40 $TD -q --until 'DONEZZZ' --session "$S" "$ST" send "finish with DONEZZZ" 2>/dev/null); rc=$?
+t1=$(date +%s)
+check "marker spelled in prompt: echo is not done" [ "$rc" -eq 0 ] && grep -q "answer-static" <<<"$out"
+check "  (waited for the real marker)"          [ $((t1 - t0)) -ge 10 ]
+$TD -q --session "$S" "$ST" stop >/dev/null 2>&1
 
 # 14. stop cleans state; shellcheck -------------------------------------------
 check "no state files left for this run"        bash -c "! ls '$STATE_DIR'/${RUN_ID}-* >/dev/null 2>&1"

@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 # Baked in at install time by cmd_install (git short hash, +-dirty if the
 # source tree had uncommitted changes). Empty when running straight from a
 # checkout, in which case _build_stamp falls back to live git.
@@ -50,6 +50,9 @@ PASTE_DELAY="${TUI_PASTE_DELAY:-0.5}"   # pause between paste and Enter
 START_TIMEOUT="${TUI_START_TIMEOUT:-60}" # max wait for the TUI to come up
 HEARTBEAT="${TUI_HEARTBEAT:-15}"        # "still waiting" log every N s (0=off)
 DONE_PATTERN="${TUI_DONE_PATTERN:-}"    # regex in the response = done (opt-in)
+DELIVER_WAIT="${TUI_DELIVER_WAIT:-10}"  # max s for a sent prompt to show up
+DISMISS_TRIES="${TUI_DISMISS_TRIES:-5}" # max overlay dismissals per check
+DISMISS_KEY="${TUI_DISMISS_KEY:-Escape}" # key that dismisses an overlay
 
 # Per-session state lives in a user-private runtime dir, not world-shared
 # /tmp: predictable /tmp names are a symlink/squat risk on shared machines,
@@ -255,6 +258,7 @@ _async_file()    { echo "${STATE_DIR}/${TUI_SESSION}.async"; }
 _poll_hash_file(){ echo "${STATE_DIR}/${TUI_SESSION}.poll-hash"; }
 _last_send_file(){ echo "${STATE_DIR}/${TUI_SESSION}.last-send"; }
 _prompt_file()   { echo "${STATE_DIR}/${TUI_SESSION}.prompt"; }
+_delivered_file(){ echo "${STATE_DIR}/${TUI_SESSION}.delivered"; }
 # Written by the pane supervisor when the TUI exits on its own (see __run).
 _exit_file()     { echo "${STATE_DIR}/${TUI_SESSION}.exit"; }
 _screen_file()   { echo "${STATE_DIR}/${TUI_SESSION}.screen"; }
@@ -283,13 +287,14 @@ _start_watchdog() {
     # the stamp file: every send/respond updates it.  If no activity for
     # WATCHDOG_TIMEOUT seconds, assume the caller is gone and clean up.
     local session="$TUI_SESSION"
-    local stamp watchdog async poll_hash last_send prompt_f
+    local stamp watchdog async poll_hash last_send prompt_f delivered
     stamp=$(_stamp_file)
     watchdog=$(_watchdog_file)
     async=$(_async_file)
     poll_hash=$(_poll_hash_file)
     last_send=$(_last_send_file)
     prompt_f=$(_prompt_file)
+    delivered=$(_delivered_file)
     local timeout="${TUI_WATCHDOG:-600}"  # 10 minutes default
 
     # Seed the stamp so the watchdog has a starting point
@@ -308,7 +313,7 @@ _start_watchdog() {
             # If the session is gone (stopped, crashed, killed elsewhere),
             # clean up our own per-session state so it does not leak into /tmp.
             if ! tmux has-session -t "=$session" 2>/dev/null; then
-                rm -f "$stamp" "$async" "$poll_hash" "$watchdog" "$last_send" "$prompt_f"
+                rm -f "$stamp" "$async" "$poll_hash" "$watchdog" "$last_send" "$prompt_f" "$delivered"
                 # If the TUI exited on its own, keep the cmd+dir lock: it is
                 # how a default-session caller still finds the exit record.
                 # start, stop or reap release it later.
@@ -323,14 +328,14 @@ _start_watchdog() {
                 idle=$((now - last))
                 if [ "$idle" -gt "$timeout" ]; then
                     tmux kill-session -t "=$session" 2>/dev/null || true
-                    rm -f "$stamp" "$async" "$poll_hash" "$watchdog" "$last_send" "$prompt_f"
+                    rm -f "$stamp" "$async" "$poll_hash" "$watchdog" "$last_send" "$prompt_f" "$delivered"
                     _rm_owned_lock "$session"
                     break
                 fi
             else
                 # No stamp file — caller probably died without stopping
                 tmux kill-session -t "=$session" 2>/dev/null || true
-                rm -f "$async" "$poll_hash" "$watchdog" "$last_send" "$prompt_f"
+                rm -f "$async" "$poll_hash" "$watchdog" "$last_send" "$prompt_f" "$delivered"
                 _rm_owned_lock "$session"
                 break
             fi
@@ -473,15 +478,18 @@ _wait_stable() {
         fi
         prev_hash="$cur_hash"
 
-        # grep without -q so python never gets SIGPIPE (pipefail would turn
-        # an early grep exit into a false negative on large responses).
-        if [ -n "$DONE_PATTERN" ] && [ -n "$prompt" ] && \
-           _extract_response "$prompt" | grep -E "$DONE_PATTERN" >/dev/null; then
-            log "Done pattern matched"
-            return 0
-        fi
-
-        if [ "$stable" -ge "$STABLE_COUNT" ]; then
+        # With --until (and a prompt to anchor on) the marker is the ONLY
+        # way to finish: a TUI running a long tool call (a build, a git
+        # hook) can sit on an unchanged screen for minutes, and treating
+        # that as "done" returned a half-finished answer with exit 0. A
+        # dialog therefore holds an --until wait until TUI_TIMEOUT (exit 3,
+        # query kept); `progress` shows it.
+        if [ -n "$DONE_PATTERN" ] && [ -n "$prompt" ]; then
+            if _until_matched "$prompt"; then
+                log "Done pattern matched"
+                return 0
+            fi
+        elif [ "$stable" -ge "$STABLE_COUNT" ]; then
             return 0
         fi
 
@@ -502,8 +510,10 @@ _wait_stable() {
 # yet (backend call, thinking pause before any output) also yields a stable
 # screen, which used to return an empty response with exit 0. Prints the
 # response; returns 0 when ready, 3 on timeout (printing what is on screen),
-# 1 if the session ended while waiting (the pending query is dropped: there
-# is nothing left to poll).
+# 4 if the prompt never reached the TUI (screen printed; callers drop the
+# pending query, since nothing is coming), 1 if the session ended while
+# waiting (the pending query is dropped: there is nothing left to poll).
+# _wait_stable's internal 4 ("session gone") becomes 1 here, never 4.
 _await_response() {
     local prompt="$1"
     local t0 waited=0 remaining response rc
@@ -517,6 +527,10 @@ _await_response() {
             _report_exited || err "Error: the session ended while waiting for the response."
             return 1
         fi
+        if [ "$rc" -eq 0 ] && ! _prompt_delivered "$prompt"; then
+            _report_undelivered "it is not on screen and was never seen arriving"
+            return 4
+        fi
         if [ "$rc" -eq 0 ]; then
             response=$(_extract_response "$prompt" warn)
             if [ -n "$response" ]; then
@@ -528,6 +542,10 @@ _await_response() {
         fi
         waited=$(( $(date +%s) - t0 ))
         if [ "$waited" -ge "$MAX_WAIT" ]; then
+            if ! _prompt_delivered "$prompt"; then
+                _report_undelivered "it is not on screen and was never seen arriving"
+                return 4
+            fi
             err "Timeout after ${MAX_WAIT}s - returning what is on screen"
             _extract_response "$prompt" warn
             return 3
@@ -543,14 +561,27 @@ _await_response() {
 # answer, so say on stderr when the prompt was not found on screen (only
 # the final extraction warns; the --until probes call this every poll).
 _extract_response() {
-    local prompt="$1" warn="${2:-}"
+    _anchor_scan extract "$1" "${2:-}"
+}
+
+# Every question about where the prompt is on screen goes through one
+# anchor search, so delivery checks, --until and extraction agree:
+#   _anchor_scan extract PROMPT [warn]  everything after the prompt echo
+#   _anchor_scan found PROMPT           prints 1 if the anchor is on screen, else 0
+#   _anchor_scan count PROMPT           lines holding the prompt's first 40 chars
+#   _anchor_scan from PROMPT            the screen FROM the anchor line on,
+#                                       echo included (whole screen if absent)
+# Always reads the full scrollback.
+_anchor_scan() {
+    local mode="$1" prompt="$2" warn="${3:-}"
     tmux capture-pane -t "=$TUI_SESSION:" -p -S - | \
-        _TUI_PROMPT="$prompt" _TUI_WARN="$warn" _TUI_SESSION="$TUI_SESSION" \
+        _TUI_MODE="$mode" _TUI_PROMPT="$prompt" _TUI_WARN="$warn" _TUI_SESSION="$TUI_SESSION" \
         python3 -c '
 import sys, os
 
 lines = sys.stdin.read().split("\n")
 prompt = os.environ.get("_TUI_PROMPT", "")
+mode = os.environ.get("_TUI_MODE", "extract")
 
 # Find the LAST line containing our prompt (the anchor). Use the first
 # LINE of the prompt (a multi-line prompt slice would contain a newline
@@ -570,6 +601,20 @@ for cut in (80, 40):
         break
     if len(first_line) <= cut:
         break
+
+if mode == "found":
+    print(1 if prompt_line >= 0 else 0)
+    sys.exit(0)
+if mode == "count":
+    needle = first_line[:40].strip()
+    # -1: no needle to look for (blank prompt), so delivery cannot be checked.
+    print(sum(1 for l in lines if needle in l) if needle else -1)
+    sys.exit(0)
+if mode == "from":
+    if prompt_line >= 0:
+        lines = lines[prompt_line:]
+    print("\n".join(lines))
+    sys.exit(0)
 
 # Everything after our prompt is the response. A multi-line prompt is
 # echoed line by line, so skip past the echo of its LAST line too: look for
@@ -601,6 +646,125 @@ while lines and not lines[-1].strip():
 if lines:
     print("\n".join(lines))
 '
+}
+
+# --until: true once DONE_PATTERN shows up on screen from the prompt anchor
+# on MORE times than it appears in the prompt itself. Counting the echo too
+# (instead of only the extracted response) means a prompt that spells the
+# marker out cannot end the wait with its own echo, even when a TUI reflows
+# the echo so that extraction fails to skip it.
+_until_matched() {
+    local prompt="$1" in_prompt on_screen
+    [ -n "$DONE_PATTERN" ] || return 1
+    # grep -c prints 0 and exits 1 on no match; it reads all of its input,
+    # so the producer never gets SIGPIPE under pipefail.
+    in_prompt=$(printf '%s\n' "$prompt" | grep -cE -- "$DONE_PATTERN" || true)
+    on_screen=$(_anchor_scan from "$prompt" | grep -cE -- "$DONE_PATTERN" || true)
+    [ "${on_screen:-0}" -gt "${in_prompt:-0}" ]
+}
+
+# The prompt counts as delivered if send saw it arrive (.delivered) or if
+# it is on screen now. Only when both fail is the query known to be lost:
+# a delivered prompt can legitimately vanish later (a full-screen TUI
+# scrolls the echo away during a long answer), which is not an error.
+_prompt_delivered() {
+    [ -f "$(_delivered_file)" ] && return 0
+    [ "$(_anchor_scan found "$1")" = "1" ]
+}
+
+# Exit-4 report: the prompt never reached the TUI's input. The screen goes
+# to stdout so the caller can see what took it.
+_report_undelivered() {
+    err "Error: the prompt was not delivered ($1)."
+    err "A dialog or overlay probably took it. The screen is below: dismiss or"
+    err "answer it (e.g. respond --key Escape), then send the prompt again."
+    _capture
+}
+
+# Overlays that sit on top of the input box and eat whatever is typed next,
+# e.g. agy's startup notices ("... esc to dismiss"). TUI_DISMISS_PATTERN
+# overrides the per-program default; set it to "" to turn dismissal off.
+# Only agy has a default: in claude, Escape at an idle prompt is not
+# harmless (two presses open the rewind menu), and its startup trust dialog
+# is a security decision, not something to click away.
+_dismiss_pattern() {
+    if [ -n "${TUI_DISMISS_PATTERN+set}" ]; then
+        printf '%s' "$TUI_DISMISS_PATTERN"
+        return 0
+    fi
+    case "$(basename "$TUI_CMD")" in
+        agy*) printf '%s' 'esc to dismiss' ;;
+    esac
+}
+
+# Press DISMISS_KEY while an overlay matching the pattern is on the bottom
+# of the VISIBLE screen (not scrollback: an old answer quoting the phrase
+# must not trigger it). Re-checks after every press, because dismissing one
+# notice can reveal the next. Returns 1 if one is still there after
+# DISMISS_TRIES presses.
+_dismiss_overlays() {
+    local pat screen hit i
+    pat=$(_dismiss_pattern)
+    [ -n "$pat" ] || return 0
+    for (( i=1; i<=DISMISS_TRIES+1; i++ )); do
+        # $(...) drops the blank rows below the last text, so tail sees
+        # the bottom of what is drawn, not the pane's empty padding.
+        screen=$(_capture)
+        hit=$(tail -n 20 <<<"$screen" | grep -iE -m1 -- "$pat" || true)
+        [ -n "$hit" ] || return 0
+        [ "$i" -le "$DISMISS_TRIES" ] || break
+        hit="${hit#"${hit%%[![:space:]]*}"}"
+        log "Dismissing overlay with $DISMISS_KEY (${i}/${DISMISS_TRIES}): ${hit:0:100}"
+        tmux send-keys -t "=$TUI_SESSION:" "$DISMISS_KEY"
+        sleep 2
+    done
+    return 1
+}
+
+# Paste the prompt, press Enter, and confirm it reached the TUI: the
+# prompt's first line must show up on screen more often than before the
+# paste (counting against a baseline, so an older copy of the same prompt
+# in scrollback proves nothing). This proves the text landed in the input
+# box or transcript, not that the TUI accepted the Enter. Records the prompt
+# (.prompt) and the confirmation (.delivered). Returns 0 when delivered,
+# 4 when not (screen printed), 1 on a hard error.
+_deliver() {
+    local prompt="$1" before now t0
+    rm -f "$(_delivered_file)" "$(_prompt_file)"
+    if ! _dismiss_overlays; then
+        _report_undelivered "an overlay is still on screen after ${DISMISS_TRIES} x ${DISMISS_KEY}; nothing was sent"
+        return 4
+    fi
+    before=$(_anchor_scan count "$prompt")
+    _paste "$prompt" || return 1
+    sleep "$PASTE_DELAY"
+    tmux send-keys -t "=$TUI_SESSION:" Enter
+    _mark_send
+    if [ "$DELIVER_WAIT" -le 0 ] || [ "$before" -lt 0 ]; then
+        # Check turned off (or a blank prompt): record the prompt but not
+        # the confirmation, so poll still checks the screen for it.
+        printf '%s\n' "$prompt" > "$(_prompt_file)"
+        return 0
+    fi
+    t0=$(date +%s)
+    while true; do
+        if ! tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
+            _report_exited || err "Error: the session ended right after the send."
+            return 1
+        fi
+        now=$(_anchor_scan count "$prompt")
+        if [ "$now" -gt "$before" ]; then
+            # The prompt is the extraction anchor for poll, respond --async
+            # and a send that times out and converts to a pending query.
+            printf '%s\n' "$prompt" > "$(_prompt_file)"
+            : > "$(_delivered_file)"
+            return 0
+        fi
+        [ $(( $(date +%s) - t0 )) -lt "$DELIVER_WAIT" ] || break
+        sleep 0.5
+    done
+    _report_undelivered "it did not appear on screen within ${DELIVER_WAIT}s"
+    return 4
 }
 
 # Paste text into this session's pane via a buffer named after the session.
@@ -688,6 +852,14 @@ cmd_start() {
         return 3
     fi
 
+    # A startup notice drawn over the input box would eat the first prompt
+    # (agy: "... esc to dismiss"), so the TUI is not ready until it is gone.
+    if ! _dismiss_overlays; then
+        err "Error: an overlay is still on screen after ${DISMISS_TRIES} x ${DISMISS_KEY}."
+        err "Session left running: inspect with 'raw', dismiss with 'respond --key ...'."
+        return 1
+    fi
+
     log "$TUI_CMD is ready"
     return 0
 }
@@ -704,18 +876,13 @@ cmd_send() {
 
     _throttle
 
-    # Send via bracketed paste (safe with !, ?, @, etc.)
-    _paste "$prompt"
-    sleep "$PASTE_DELAY"
-    tmux send-keys -t "=$TUI_SESSION:" Enter
-    _mark_send
-    # Remember the prompt: it is the extraction anchor for respond --async
-    # and for a send that times out and converts to a pending async query.
-    printf '%s\n' "$prompt" > "$(_prompt_file)"
+    # Bracketed paste (safe with !, ?, @, etc.), Enter, delivery check.
+    local rc=0
+    _deliver "$prompt" || rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
 
     log "Prompt sent, waiting for screen to stabilise ..."
 
-    local rc=0
     _await_response "$prompt" || rc=$?
     if [ "$rc" -eq 3 ]; then
         # Convert the timed-out send into a pending async query so the
@@ -802,9 +969,27 @@ cmd_respond() {
             # No recorded prompt (respond before any send): fall back to the
             # reply as anchor — poll returns everything after it.
             printf '%s\n' "$reply" > "$(_async_file)"
+            # Nothing was ever sent to check delivery of; do not let poll
+            # report this anchor as an undelivered prompt.
+            : > "$(_delivered_file)"
         fi
         rm -f "$(_poll_hash_file)"
         log "Reply sent (async). Use 'poll' or 'poll --wait' to retrieve the response."
+        _stamp
+        return 0
+    fi
+
+    if [ "$key_mode" = true ]; then
+        # A keypress (dismiss an overlay, pick a menu item) needs no
+        # stability wait: one poll interval for the TUI to redraw, then one
+        # capture. Waiting for a stable screen made `respond --key Escape`
+        # on a busy TUI block for up to TUI_TIMEOUT.
+        sleep "$POLL_INTERVAL"
+        if ! tmux has-session -t "=$TUI_SESSION" 2>/dev/null; then
+            _report_exited || err "Error: the session ended after the keypress."
+            return 1
+        fi
+        _capture
         _stamp
         return 0
     fi
@@ -869,14 +1054,14 @@ cmd_send_async() {
 
     _throttle
 
-    # Send via bracketed paste (safe with !, ?, @, etc.)
-    _paste "$prompt"
-    sleep "$PASTE_DELAY"
-    tmux send-keys -t "=$TUI_SESSION:" Enter
-    _mark_send
-    # Remember the prompt: it is the extraction anchor for respond --async
-    # and for a send that times out and converts to a pending async query.
-    printf '%s\n' "$prompt" > "$(_prompt_file)"
+    # Bracketed paste (safe with !, ?, @, etc.), Enter, delivery check. An
+    # undelivered prompt fails here (exit 4) and leaves nothing pending.
+    local rc=0
+    _deliver "$prompt" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        _stamp
+        return "$rc"
+    fi
 
     # Save prompt anchor and reset poll state for this session
     printf '%s\n' "$prompt" > "$async_file"
@@ -905,6 +1090,15 @@ cmd_poll() {
 
     local prompt
     prompt=$(cat "$async_file")
+
+    # A prompt that never arrived has no answer coming: say so (exit 4)
+    # instead of waiting, or handing back the whole screen as "the answer".
+    if ! _prompt_delivered "$prompt"; then
+        rm -f "$async_file" "$poll_hash_file"
+        _report_undelivered "it is not on screen and was never seen arriving"
+        _stamp
+        return 4
+    fi
 
     if [ "$wait_mode" = true ]; then
         # Blocking mode: reuse _wait_stable's poll loop, then extract.
@@ -964,10 +1158,10 @@ cmd_poll() {
         # screen must be stable AND the response non-empty. A stable but
         # empty screen is a TUI that has not started answering yet, so it is
         # "waiting", not an empty answer (which also cleared the query).
+        # With --until, only the marker completes (see _wait_stable).
         local done_now=false
-        if [ -n "$DONE_PATTERN" ] && \
-           _extract_response "$prompt" | grep -E "$DONE_PATTERN" >/dev/null; then
-            done_now=true
+        if [ -n "$DONE_PATTERN" ]; then
+            if _until_matched "$prompt"; then done_now=true; fi
         elif [ "$stable" -ge "$STABLE_COUNT" ]; then
             done_now=true
         fi
@@ -1021,7 +1215,7 @@ cmd_stop() {
     else
         log "No session to stop"
     fi
-    rm -f "$(_stamp_file)" "$(_async_file)" "$(_poll_hash_file)" "$(_last_send_file)" "$(_prompt_file)"
+    rm -f "$(_stamp_file)" "$(_async_file)" "$(_poll_hash_file)" "$(_last_send_file)" "$(_prompt_file)" "$(_delivered_file)"
     _rm_owned_lock "$TUI_SESSION"
 }
 
@@ -1167,7 +1361,7 @@ _iter_managed_sessions() {
 _clear_session_state() {
     # Remove every state file for the session, current and legacy layout.
     local session="$1" ext
-    for ext in stamp watchdog async poll-hash last-send prompt; do
+    for ext in stamp watchdog async poll-hash last-send prompt delivered; do
         rm -f "${STATE_DIR}/${session}.${ext}" \
               "/tmp/.tui-driver-${session}.${ext}"
     done
@@ -1396,11 +1590,14 @@ Flags:
                     same command from the same directory in parallel. Pass the
                     same NAME to every send/respond/poll/stop for that session.
   --dir DIR         Set the working directory
-  --until REGEX     Treat the response as complete the moment REGEX appears
-                    in it (no stability tail). Word the instruction so the
+  --until REGEX     The response is complete when REGEX appears in it, and
+                    ONLY then: a still screen (a long build or git hook)
+                    no longer ends the wait. Word the instruction so the
                     literal marker is NOT in your prompt, e.g. tell the TUI
                     "end with the word DONE and three exclamation marks"
-                    and pass --until 'DONE!!!'
+                    and pass --until 'DONE!!!'. An approval dialog holds an
+                    --until wait until TUI_TIMEOUT (exit 3, query kept):
+                    check on long waits with `progress`
   --quiet, -q       Suppress stderr progress logs (errors still shown)
   --version, -v     Print the tui-driver version
 
@@ -1409,6 +1606,9 @@ Exit codes:
   1   hard error (no session, no pending async, bad usage)
   2   poll: response not ready yet (prints "waiting")
   3   timeout (start/send/respond/poll --wait) — output may be incomplete
+  4   send/send-async/poll: the prompt was NOT delivered (a dialog or
+      overlay took it); the screen is printed and nothing is left pending.
+      Dismiss or answer what is on screen, then send again
 
 Environment (override any default):
   TUI_POLL          poll interval        (default: 2s)
@@ -1420,6 +1620,14 @@ Environment (override any default):
   TUI_START_TIMEOUT max wait at startup  (default: 60s)
   TUI_HEARTBEAT     "still waiting" log every N s while blocked (default: 15, 0=off)
   TUI_DONE_PATTERN  completion regex, same as --until (default: unset)
+  TUI_DELIVER_WAIT  max s for a sent prompt to appear on screen before
+                    send fails with exit 4 (default: 10, 0=don't check)
+  TUI_DISMISS_PATTERN  regex of an overlay that eats input; start and send
+                    press TUI_DISMISS_KEY while it shows on the bottom of
+                    the screen (default: 'esc to dismiss' for agy*, none
+                    for others; "" = off)
+  TUI_DISMISS_KEY   key that dismisses it   (default: Escape)
+  TUI_DISMISS_TRIES max presses per check   (default: 5)
   TUI_DIR           working dir          (default: cwd)
   TUI_WIDTH         terminal width       (default: 200)
   TUI_HEIGHT        terminal height      (default: 50)

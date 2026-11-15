@@ -79,9 +79,8 @@ chmod +x ~/.local/bin/agy-web
 Adjust the model id to taste — `agy models` lists what is available (the effort level is
 baked into the id, e.g. `gemini-3.8-flash-{high,medium,low}`). **An id that no longer
 exists does NOT fail loudly:** `agy` shows a warning inside the TUI and silently runs
-another model (seen in 2026-11, when `gemini-3.6-flash-high` was retired and sessions ran
-"Orchestrator (Argon)" instead). After changing the wrapper, start a session and check the
-model named in the banner and status bar.
+another model. After changing the wrapper, or when a model may have been retired, start a
+session and check the model named in the banner and status bar.
 
 **Why a wrapper instead of a flag or a config file:** `tui-driver <cmd> start` launches
 the command token as given; a token with spaces and flags in it does not work well with
@@ -106,10 +105,16 @@ running, `start` will tell you — that's fine, just proceed with `send-async`.
 
 **First run in a new directory:** `agy` shows a trust dialog ("Do you trust the contents
 of this project? ❯ Yes, I trust this folder / No, exit"). A query sent while it is up is
-swallowed by it (tui-driver then warns that the prompt was not found on screen). After a
+swallowed by it (`send-async` then fails with exit 4, "not delivered", and prints the
+screen; nothing is left pending). After a
 `start` in a directory agy has not seen, look once with `tui-driver agy-web raw` and, if
 the dialog is there and the directory is one the user trusts, confirm the highlighted
 "Yes" with `tui-driver agy-web respond --key Enter`.
+
+**Startup notices** ("... esc to dismiss" banners after an agy update) are different:
+they carry no decision, and `start` presses Escape until they are gone (it logs each
+press). If one shows up later and eats a prompt, the send fails with exit 4: dismiss it
+with `tui-driver agy-web respond --key Escape` and send again.
 
 ```bash
 # Start an Antigravity session (safe to call if unsure — errors if already running)
@@ -158,7 +163,7 @@ tui-driver -q agy-web send-async "Search for: <your detailed query here>" \
 That one backgrounded call starts the session if needed, sends the query, waits,
 and hands you the whole response through the completion notification.
 
-**Why one call and not the old two-step:** there is nothing left to forget. The
+**Why one call:** there is nothing left to forget. The
 `start` prefix is a free no-op on a live session (exit 1 in ~0 s, session
 untouched), `send-async` takes the pending lock so a second query cannot corrupt
 the pane, and `&&` means a failed send never leaves a stray poll behind.
@@ -182,7 +187,10 @@ tui-driver agy-web poll    # prints "waiting" (exit 2) if not ready, or the full
 
 **Exit codes (same for send/poll/respond):** `0` = response ready, `1` =
 hard error (no session, no pending query — the reason is printed to stderr
-even with `-q`), `2` = still working (`poll`), `3` = timeout.
+even with `-q`), `2` = still working (`poll`), `3` = timeout, `4` = the prompt
+was **not delivered** (a dialog or overlay took it; the screen is printed and
+nothing is pending — deal with what is on screen, then send again). Never
+treat a non-zero exit as an answer.
 
 **How `poll` behaves (so you don't get stuck):**
 - Only **one** `send-async` can be pending per session at a time. If you try
@@ -227,16 +235,13 @@ Three parallel lookups cost about what one costs. Rules:
   each is a full Antigravity process. The 600 s idle watchdog is a backstop, not
   a plan.
 - Keep it to ~3 concurrent sessions. More buys little and costs memory.
-- Needs tui-driver ≥ 0.4.0 (check with `tui-driver --version`). Before 0.3.1, sends
-  pasted through tmux's *unnamed* buffer, which is shared process-wide: parallel sends
-  raced and a session could receive another session's prompt — silently, with a
-  plausible answer to the wrong question. Before 0.4.0, session names were matched by
-  prefix (`web1` could reach `web10`), and approvals needed `--key` to work at all.
+- Needs tui-driver ≥ 0.4.0 (check with `tui-driver --version`); older versions can
+  silently deliver one session's prompt to another, or match the wrong session by name
+  prefix.
 
 ### Where the wall-clock actually goes
 
-Measured on this machine (Gemini 3.6 Flash, high effort — since retired; the current
-Flash should be in the same range, but it has not been re-measured):
+Rough timings on this machine (measured on an earlier Flash model at high effort):
 
 | Step | Cost |
 |------|------|
@@ -263,8 +268,10 @@ the answer is complete:
   tui-driver -q agy-web send-async "<query>; end your reply with the word DONE followed by three exclamation marks"
   tui-driver --until 'DONE!!!' -q agy-web poll --wait
   ```
-  Word the prompt so the literal marker never appears in it, or the pattern
-  matches the echoed prompt immediately.
+  Word the prompt so the literal marker never appears in it. With `--until`
+  only the marker ends the wait (a still screen during a long tool call no
+  longer does), so an approval dialog holds it until `TUI_TIMEOUT` (exit 3,
+  query kept): check a long wait with `progress`.
 
 None of this matters as much as the one habit that does: **fire the call in the
 background and go do something else.** A 12-second search costs zero if you
@@ -287,9 +294,9 @@ tui-driver agy-web send-async "Read https://www.monolithicpower.com/en/mp2359.ht
 
 ## Document Fetching & Processing
 
-Antigravity can read documents (PDFs, datasheets, specs) directly from URLs. Use
-this for any online document that needs to be read, summarized, or have
-specific information extracted.
+Antigravity can read documents (PDFs, datasheets, specs) directly from URLs. As
+with web pages, use it for a document only after WebFetch (or downloading the file
+and reading it locally) has failed or come back thin.
 
 **Always tell Antigravity exactly what to extract** — don't just say "read this PDF."
 Give it specific questions or extraction targets so it returns structured,
@@ -334,7 +341,7 @@ tui-driver agy-web respond --async --key Escape   # cancel
 
 Use the numbers the menu actually shows. Do **not** reply with `"y"`/`"n"` text: the menu
 ignores it, and the Enter that follows a text reply accepts the highlighted default —
-which is "Yes". (Before tui-driver 0.4.0, `respond "n"` approved the command.)
+which is "Yes".
 
 After responding, run `poll --wait` (in the background) to get the actual
 response. (Plain `respond` without `--async` blocks and prints the resulting
@@ -395,4 +402,4 @@ the value as unverified and let the user decide — do not quietly use it anyway
     and trust the completion notification. Do not re-poll to "check". If you genuinely
     suspect a stall, `tui-driver agy-web progress` is read-only and safe — never `raw`.
 11. **Verify before you use, always** — the output is a suggestion, not truth. Ask Antigravity to save raw output to a file (e.g. `/tmp/result.md`), read it yourself, and confirm against the primary source — testably where a test is possible. If you can't verify it, label it unverified and don't build on it. See the READ FIRST section at the top.
-12. **Never use plain `agy`** — the command token is `agy-web`, a wrapper that pins the model to Gemini 3.8 Flash at high reasoning effort (see Prerequisites above; create it if missing). Bare `agy` follows a mutable global default that any in-TUI `/model` switch silently changes.
+12. **Never use plain `agy`** — the command token is `agy-web`, a wrapper that pins the model and reasoning effort (see Prerequisites above; create it if missing). Bare `agy` follows a mutable global default that any in-TUI `/model` switch silently changes.
