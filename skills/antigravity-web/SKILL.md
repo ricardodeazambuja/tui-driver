@@ -344,8 +344,8 @@ ignores it, and the Enter that follows a text reply accepts the highlighted defa
 which is "Yes".
 
 After responding, run `poll --wait` (in the background) to get the actual
-response. (Plain `respond` without `--async` blocks and prints the resulting
-screen itself — fine for quick dialogs in synchronous flows.)
+response. (Plain `respond` without `--async` prints the resulting screen itself:
+a text reply waits for the screen to settle, `--key` returns after about 2 s.)
 
 ## Verification Recipes (see the READ FIRST warning above)
 

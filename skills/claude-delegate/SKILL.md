@@ -171,8 +171,11 @@ of your own prompt can't match the pattern.)
 ## Handling the Sub-Claude's Permission Prompts
 
 A driven `claude` will pause on tool-permission dialogs (edit a file, run a
-command, etc.). Your `poll` will return with the dialog text on screen instead
-of a final answer. It is a numbered menu (`1. Yes`, `2. Yes, and always
+command, etc.). Without `--until`, your `poll` returns with the dialog text on
+screen instead of a final answer. **With `--until`** (recommended above), a dialog
+does not end the wait: `poll --wait` holds until `TUI_TIMEOUT` (exit 3, task
+kept pending). So on a long wait, check with `tui-driver claude progress`: it
+shows the last screen lines, dialog included, without consuming anything. It is a numbered menu (`1. Yes`, `2. Yes, and always
 allow …`, …, `4. No`). Read it, decide, and reply with `respond --async --key N`,
 which presses that one key (no Enter) and re-arms the pending task so the next
 `poll --wait` picks up where it left off:

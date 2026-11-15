@@ -1707,8 +1707,10 @@ How poll works (read this before driving from an agent):
   * A timeout (exit 3) does NOT consume the query: it prints what is on
     screen and keeps it pending. Poll again for the rest, raise
     TUI_TIMEOUT, or run 'cancel' to drop it.
-  * If a query stalls on an approval dialog, a plain `poll` returns the
-    dialog text (and clears the pending record); reply with
+  * If a query stalls on an approval dialog, a plain `poll` (without
+    --until) returns the dialog text (and clears the pending record);
+    with --until the wait holds until TUI_TIMEOUT, so spot it with
+    `progress`. Reply with
     `respond --async "y"` (line prompt) or `respond --async --key 1`
     (claude/agy menu) and then poll again for the real response.
   * To check on a pending query WITHOUT retrieving it, use `progress`

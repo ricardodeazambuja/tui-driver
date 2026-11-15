@@ -153,7 +153,8 @@ Enter after it would approve that second call unseen. (Before 0.4.0,
 `respond "n"` pasted the "n" and pressed Enter, which **approved** the
 command.) Read the menu first and pick the number it shows.
 
-`respond` blocks and prints the resulting screen itself. When the dialog
+`respond` prints the resulting screen itself (a text reply waits for the
+screen to settle; `--key` returns one `TUI_POLL` after the keypress). When the dialog
 interrupted an **async** query, add `--async`: it replies, returns
 immediately, and re-arms the pending query so a follow-up `poll` /
 `poll --wait` retrieves the real response:
@@ -610,8 +611,10 @@ TUI that echoes input -- which is virtually all of them.
 
 A multi-line prompt is echoed line by line, so after the anchor the
 response also skips past the echo of the prompt's last line. If the prompt
-is not on screen at all (a dialog took it — e.g. a startup trust prompt),
-the whole screen is returned and a warning is printed on stderr.
+was never seen arriving (a dialog took it — e.g. a startup trust prompt),
+`send`/`send-async` fail with exit 4 and print the screen (see "Delivery
+check"). If it did arrive and later scrolled away, the whole screen is
+returned with a warning on stderr.
 
 ### Screen stabilisation, not parsing
 
@@ -839,8 +842,9 @@ tui-driver agy stop
 
 The repo ships a self-contained smoke test that exercises the full
 lifecycle (start/send/async/poll/dialog/`--until`/timeout/cleanup, plus
-exact session names, TUI exit and crash handling, keypress menus and
-multi-line prompts)
+exact session names, TUI exit and crash handling, keypress menus,
+multi-line prompts, delivery checks (exit 4), overlay dismissal and the
+strict `--until` on a long still screen)
 against tiny synthetic TUIs — no AI CLI needed, just tmux and python3:
 
 ```bash
