@@ -659,6 +659,9 @@ _until_matched() {
     # grep -c prints 0 and exits 1 on no match; it reads all of its input,
     # so the producer never gets SIGPIPE under pipefail.
     in_prompt=$(printf '%s\n' "$prompt" | grep -cE -- "$DONE_PATTERN" || true)
+    # Echo scrolled away (full-screen TUI, long answer): the prompt's own
+    # copy of the marker is not on screen either, so one match is enough.
+    [ "$(_anchor_scan found "$prompt")" = "1" ] || in_prompt=0
     on_screen=$(_anchor_scan from "$prompt" | grep -cE -- "$DONE_PATTERN" || true)
     [ "${on_screen:-0}" -gt "${in_prompt:-0}" ]
 }
@@ -676,8 +679,10 @@ _prompt_delivered() {
 # to stdout so the caller can see what took it.
 _report_undelivered() {
     err "Error: the prompt was not delivered ($1)."
-    err "A dialog or overlay probably took it. The screen is below: dismiss or"
-    err "answer it (e.g. respond --key Escape), then send the prompt again."
+    err "A dialog or overlay probably took it. Look at the screen below first:"
+    err "if the TUI is in fact working on your prompt, do NOT send it again"
+    err "(that would run the task twice). Otherwise dismiss or answer what is"
+    err "on screen (e.g. respond --key Escape) and send the prompt again."
     _capture
 }
 

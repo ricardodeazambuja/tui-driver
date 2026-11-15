@@ -31,10 +31,10 @@ t FORCE 'tui-driver --session q1 -q agy-web poll --wait'
 t FORCE 'tui-driver agy-web respond "y"'
 t FORCE '/home/ricardodeazambuja/.local/bin/tui-driver -q agy-web poll --wait'
 
-t FORCE 'tui-driver agy-web respond --key Escape'
 
 echo "--- must PASS THROUGH untouched ---"
 t PASS  'tui-driver agy-web respond --async --key 4'
+t PASS  'tui-driver agy-web respond --key Escape'
 t PASS  'tui-driver agy-web respond --key 4 --async'
 
 t PASS  'tui-driver -q agy-web poll --wait' true

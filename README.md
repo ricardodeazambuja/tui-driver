@@ -487,7 +487,7 @@ pending), but the turn is wasted.
 
 `hooks/tui-driver-bg.sh` is a Claude Code `PreToolUse` hook that removes the
 choice: it parses the Bash command, and if it is a tui-driver invocation using a
-blocking action (`send`, `respond` without `--async`, or `poll --wait`) that is
+blocking action (`send`, `respond` without `--async` or `--key`, or `poll --wait`) that is
 not already backgrounded, it rewrites the tool input to set
 `run_in_background: true`. It grants no permission: Claude Code applies the
 rewritten input and then runs its normal permission flow (your rules, your

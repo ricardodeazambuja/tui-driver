@@ -68,7 +68,8 @@ is_blocking_seg() {
     case "$action" in
         send) return 0 ;;
         poll) [[ "$a1" == --wait || "$a2" == --wait ]] && return 0 ;;
-        respond) [ "$has_async" = true ] || return 0 ;;
+        # respond --key returns after one TUI_POLL (0.5.0+): not blocking.
+        respond) [ "$has_async" = true ] || [ "$key_mode" = true ] || return 0 ;;
     esac
     return 1
 }
