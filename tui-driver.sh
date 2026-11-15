@@ -568,14 +568,18 @@ _extract_response() {
 # anchor search, so delivery checks, --until and extraction agree:
 #   _anchor_scan extract PROMPT [warn]  everything after the prompt echo
 #   _anchor_scan found PROMPT           prints 1 if the anchor is on screen, else 0
-#   _anchor_scan count PROMPT           lines holding the prompt's first 40 chars
+#   _anchor_scan snap PROMPT            the lines holding the prompt's first
+#                                       40 chars (a delivery baseline)
+#   _anchor_scan newer PROMPT SNAP      prints 1 if one of those lines is now
+#                                       on screen more often than in SNAP
 #   _anchor_scan from PROMPT            the screen FROM the anchor line on,
 #                                       echo included (whole screen if absent)
 # Always reads the full scrollback.
 _anchor_scan() {
-    local mode="$1" prompt="$2" warn="${3:-}"
+    local mode="$1" prompt="$2" extra="${3:-}"
     tmux capture-pane -t "=$TUI_SESSION:" -p -S - | \
-        _TUI_MODE="$mode" _TUI_PROMPT="$prompt" _TUI_WARN="$warn" _TUI_SESSION="$TUI_SESSION" \
+        _TUI_MODE="$mode" _TUI_PROMPT="$prompt" _TUI_WARN="$extra" _TUI_BASE="$extra" \
+        _TUI_SESSION="$TUI_SESSION" \
         python3 -c '
 import sys, os
 
@@ -605,10 +609,21 @@ for cut in (80, 40):
 if mode == "found":
     print(1 if prompt_line >= 0 else 0)
     sys.exit(0)
-if mode == "count":
+if mode in ("snap", "newer"):
+    # Compare whole line strings, not a total count: a short needle ("hi")
+    # also sits inside unrelated lines ("shift+tab"), and when those vanish
+    # (an overlay closing mid-send) a total can drop even though the
+    # echo line of the prompt is new.
     needle = first_line[:40].strip()
-    # -1: no needle to look for (blank prompt), so delivery cannot be checked.
-    print(sum(1 for l in lines if needle in l) if needle else -1)
+    hits = [l.rstrip() for l in lines if needle and needle in l]
+    if mode == "snap":
+        print("\n".join(hits))
+    else:
+        from collections import Counter
+        base = os.environ.get("_TUI_BASE", "")
+        before = Counter(base.split("\n")) if base else Counter()
+        now = Counter(hits)
+        print(1 if any(now[k] > before[k] for k in now) else 0)
     sys.exit(0)
 if mode == "from":
     if prompt_line >= 0:
@@ -698,7 +713,7 @@ _dismiss_pattern() {
         return 0
     fi
     case "$(basename "$TUI_CMD")" in
-        agy*) printf '%s' 'esc to dismiss' ;;
+        agy*) printf '%s' 'esc to dismiss|esc Close' ;;
     esac
 }
 
@@ -726,10 +741,24 @@ _dismiss_overlays() {
     return 1
 }
 
-# Paste the prompt, press Enter, and confirm it reached the TUI: the
-# prompt's first line must show up on screen more often than before the
-# paste (counting against a baseline, so an older copy of the same prompt
-# in scrollback proves nothing). This proves the text landed in the input
+# Wait (at most 2 s) for two identical screen samples 0.5 s apart. Never
+# fails: a TUI with an animated idle screen just costs the 2 s.
+_settle_screen() {
+    local prev cur i
+    prev=$(_screen_hash)
+    for (( i=0; i<4; i++ )); do
+        sleep 0.5
+        cur=$(_screen_hash)
+        [ "$cur" != "$prev" ] || return 0
+        prev="$cur"
+    done
+}
+
+# Paste the prompt, press Enter, and confirm it reached the TUI: some line
+# holding the prompt's first line must show up on screen more often than
+# before the paste (compared line by line against a baseline, so an older
+# copy of the same prompt in scrollback proves nothing, and lines that
+# merely contain a short prompt vanishing does not hide the new echo). This proves the text landed in the input
 # box or transcript, not that the TUI accepted the Enter. Records the prompt
 # (.prompt) and the confirmation (.delivered). Returns 0 when delivered,
 # 4 when not (screen printed), 1 on a hard error.
@@ -740,12 +769,20 @@ _deliver() {
         _report_undelivered "an overlay is still on screen after ${DISMISS_TRIES} x ${DISMISS_KEY}; nothing was sent"
         return 4
     fi
-    before=$(_anchor_scan count "$prompt")
+    local check=true
+    if [ "$DELIVER_WAIT" -le 0 ] || [ -z "${prompt//[[:space:]]/}" ]; then
+        check=false
+    else
+        # Let a redraw in flight (an overlay closing after a respond
+        # --async --key Escape) finish before taking the baseline.
+        _settle_screen
+        before=$(_anchor_scan snap "$prompt")
+    fi
     _paste "$prompt" || return 1
     sleep "$PASTE_DELAY"
     tmux send-keys -t "=$TUI_SESSION:" Enter
     _mark_send
-    if [ "$DELIVER_WAIT" -le 0 ] || [ "$before" -lt 0 ]; then
+    if [ "$check" = false ]; then
         # Check turned off (or a blank prompt): record the prompt but not
         # the confirmation, so poll still checks the screen for it.
         printf '%s\n' "$prompt" > "$(_prompt_file)"
@@ -757,8 +794,8 @@ _deliver() {
             _report_exited || err "Error: the session ended right after the send."
             return 1
         fi
-        now=$(_anchor_scan count "$prompt")
-        if [ "$now" -gt "$before" ]; then
+        now=$(_anchor_scan newer "$prompt" "$before")
+        if [ "$now" = "1" ]; then
             # The prompt is the extraction anchor for poll, respond --async
             # and a send that times out and converts to a pending query.
             printf '%s\n' "$prompt" > "$(_prompt_file)"
@@ -1629,7 +1666,7 @@ Environment (override any default):
                     send fails with exit 4 (default: 10, 0=don't check)
   TUI_DISMISS_PATTERN  regex of an overlay that eats input; start and send
                     press TUI_DISMISS_KEY while it shows on the bottom of
-                    the screen (default: 'esc to dismiss' for agy*, none
+                    the screen (default: 'esc to dismiss|esc Close' for agy*, none
                     for others; "" = off)
   TUI_DISMISS_KEY   key that dismisses it   (default: Escape)
   TUI_DISMISS_TRIES max presses per check   (default: 5)

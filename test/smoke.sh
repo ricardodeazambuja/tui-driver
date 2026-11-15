@@ -25,7 +25,7 @@ check() { # check <description> <condition...>
 cleanup() {
     local s
     for s in pong delay spin dialog until pfx10 pfx1 miss once norm menu multi noecho \
-             ovl ovloff static alt; do
+             ovl ovloff static alt short; do
         $TD -q --session "${RUN_ID}-${s}" true stop >/dev/null 2>&1 || true
     done
     $TD -q --dir "$TMPDIR_T/dflt" "$TMPDIR_T/pong-tui.sh" stop >/dev/null 2>&1 || true
@@ -121,6 +121,18 @@ cat > "$TMPDIR_T/alt-tui.sh" <<'EOF2'
 # Echoes the prompt, then answers on the alternate screen, where the echo is
 # gone: a delivered prompt that later scrolls away is not an error.
 while read -r x; do sleep 2; tput smcup; clear; echo "alt-answer"; done
+EOF2
+cat > "$TMPDIR_T/short-tui.sh" <<'EOF2'
+#!/usr/bin/env bash
+# A help overlay with many lines that contain a short prompt ("hi") as a
+# substring; it is replaced by the alternate screen once a line arrives, so
+# the screen holds FEWER needle lines after delivery than before.
+for k in "shift+tab  cycle mode" "shift+up  history" "shift+down  history" "shift+click  select"; do
+    echo "$k"
+done
+read -r x
+tput smcup; clear; echo "> $x"; echo "short-answer"
+read -r _
 EOF2
 chmod +x "$TMPDIR_T"/*.sh
 
@@ -339,6 +351,14 @@ TUI_DISMISS_PATTERN='' TUI_TIMEOUT=60 $TD -q --session "$S" "$OVL" respond --key
 t1=$(date +%s)
 check "respond --key returns quickly (exit 0)"  [ "$rc" -eq 0 ] && [ $((t1 - t0)) -lt 6 ]
 $TD -q --session "$S" "$OVL" stop >/dev/null 2>&1
+
+# 13b2. Short prompt whose needle fills the old screen: still delivered ----
+S="${RUN_ID}-short"
+$TD -q --session "$S" "$TMPDIR_T/short-tui.sh" start >/dev/null 2>&1
+out=$(TUI_DELIVER_WAIT=4 $TD -q --session "$S" "$TMPDIR_T/short-tui.sh" send "hi" 2>/dev/null); rc=$?
+check "short prompt, needle-heavy old screen: exit 0" [ "$rc" -eq 0 ]
+check "  answer returned"                       grep -q "short-answer" <<<"$out"
+$TD -q --session "$S" "$TMPDIR_T/short-tui.sh" stop >/dev/null 2>&1
 
 # 13c. --until is strict: a long static screen does not end the wait ----------
 S="${RUN_ID}-static"

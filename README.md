@@ -402,8 +402,9 @@ pending). On long waits, check with `progress`; answer a dialog with
 `respond --async --key ...` and poll again.
 
 **Delivery check (exit 4).** `send` and `send-async` confirm that the prompt
-reached the TUI: after Enter, its first line must show up on screen (more
-often than before the paste) within `TUI_DELIVER_WAIT` seconds. If a dialog
+reached the TUI: after Enter, a line holding the prompt's first line must
+show up on screen more often than it did before the paste (compared line by
+line, after letting the screen settle) within `TUI_DELIVER_WAIT` seconds. If a dialog
 or overlay swallowed it, they fail with **exit 4** and print the screen;
 nothing is left pending. `poll` also returns 4 for a pending prompt that was
 never seen arriving and is not on screen. (A prompt that *was* seen arriving
@@ -416,7 +417,8 @@ the next keystrokes — agy shows "... esc to dismiss" banners after an
 update. `start` (and every send) presses `TUI_DISMISS_KEY` (Escape) while
 `TUI_DISMISS_PATTERN` matches the bottom of the visible screen, up to
 `TUI_DISMISS_TRIES` times, logging each press, and `start` fails (exit 1)
-if one is still there. The default pattern is `esc to dismiss` for commands
+if one is still there. The default pattern is `esc to dismiss|esc Close` (the
+startup notices and agy's `?` shortcuts screen) for commands
 named `agy*` and none for anything else: in `claude`, Escape at the prompt is
 not harmless, and its trust dialog is a decision to make, not a notice to
 click away. Set `TUI_DISMISS_PATTERN=''` to turn it off.
@@ -581,7 +583,7 @@ elsewhere (or that were orphaned when a caller died).
 | `TUI_HEARTBEAT` | `15` | "still waiting" log line every N seconds while blocked (0 = off) |
 | `TUI_DONE_PATTERN` | unset | Completion regex, same as `--until` |
 | `TUI_DELIVER_WAIT` | `10` | Max seconds for a sent prompt to appear on screen before exit 4 (0 = don't check at send time) |
-| `TUI_DISMISS_PATTERN` | `esc to dismiss` for `agy*`, else unset | Regex of an input-eating overlay to dismiss at start and before each send (`''` = off) |
+| `TUI_DISMISS_PATTERN` | `esc to dismiss\|esc Close` for `agy*`, else unset | Regex of an input-eating overlay to dismiss at start and before each send (`''` = off) |
 | `TUI_DISMISS_KEY` | `Escape` | Key that dismisses it |
 | `TUI_DISMISS_TRIES` | `5` | Max presses per check |
 
