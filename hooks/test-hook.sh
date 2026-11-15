@@ -29,7 +29,13 @@ t FORCE 'tui-driver -q agy-web start 2>/dev/null; tui-driver -q agy-web send-asy
 t FORCE 'TUI_TIMEOUT=600 TUI_STABLE=3 tui-driver -q agy-web poll --wait'
 t FORCE 'tui-driver --session q1 -q agy-web poll --wait'
 t FORCE 'tui-driver agy-web respond "y"'
-t FORCE '/home/ricardodeazambuja/.local/bin/tui-driver -q agy-web poll --wait'
+# Claude Code hands the hook the command text UNEXPANDED: "$HOME" and "~"
+# arrive literally, and the hook must still recognise the binary.
+# shellcheck disable=SC2016  # literal on purpose: the hook sees it unexpanded
+t FORCE '$HOME/.local/bin/tui-driver -q agy-web poll --wait'
+# shellcheck disable=SC2088  # same for the tilde
+t FORCE '~/.local/bin/tui-driver -q agy-web poll --wait'
+t FORCE '/usr/local/bin/tui-driver -q agy-web poll --wait'
 
 
 echo "--- must PASS THROUGH untouched ---"
